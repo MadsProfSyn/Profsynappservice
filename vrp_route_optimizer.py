@@ -4,6 +4,8 @@ Lightweight Route Optimizer for Pre-Assigned Inspections
 This module solves ONLY the routing problem (TSP) when inspections have already
 been assigned to inspectors by the user via drag & drop UI.
 
+UPDATED: Now works directly with monday_items_selected table (not inspection_queue)
+
 Expected performance: <2 seconds for typical workloads (2-5 inspectors, 3-7 inspections each)
 """
 
@@ -91,14 +93,53 @@ def round_to_nearest_5_min(dt: datetime) -> datetime:
 
 
 # ============================================================================
+# INSPECTION TYPE TO DURATION MAPPING
+# ============================================================================
+
+def get_inspection_duration(inspection_type: str, rooms: int) -> int:
+    """
+    Get inspection duration in minutes based on type and room count.
+    Falls back to default if not found.
+    """
+    # Map Danish inspection types to abbreviations
+    type_mapping = {
+        'Proforma': 'PA',
+        'Projektsyn': 'PS', 
+        'Indflytningssyn': 'IF',
+        'Fraflytningssyn': 'FF'
+    }
+    
+    abbrev = type_mapping.get(inspection_type)
+    if not abbrev:
+        print(f"  ⚠️ Unknown inspection type: {inspection_type}, using default 45 min")
+        return 45
+    
+    try:
+        result = supabase.table('inspection_durations')\
+            .select('minutes')\
+            .eq('inspection_type', abbrev)\
+            .eq('rooms', rooms)\
+            .execute()
+        
+        if result.data and len(result.data) > 0:
+            return result.data[0]['minutes']
+    except Exception as e:
+        print(f"  ⚠️ Error fetching duration: {e}")
+    
+    # Default durations by type
+    defaults = {'PA': 30, 'PS': 45, 'IF': 45, 'FF': 60}
+    return defaults.get(abbrev, 45)
+
+
+# ============================================================================
 # TSP SOLVER - Finds optimal route order
 # ============================================================================
 
 def solve_tsp_bruteforce(
     home_coords: Tuple[float, float],
     stop_coords: List[Tuple[float, float]],
-    stop_ids: List[str]
-) -> Tuple[List[str], float]:
+    stop_ids: List[int]
+) -> Tuple[List[int], float]:
     """
     Solve TSP via brute force for small number of stops (≤7).
     Returns optimal order of stop_ids and total distance in km.
@@ -109,7 +150,6 @@ def solve_tsp_bruteforce(
         return [], 0.0
     
     if len(stop_coords) == 1:
-        # Single stop - trivial
         km = haversine_km(home_coords[0], home_coords[1], stop_coords[0][0], stop_coords[0][1])
         km += haversine_km(stop_coords[0][0], stop_coords[0][1], home_coords[0], home_coords[1])
         return [stop_ids[0]], km
@@ -117,7 +157,6 @@ def solve_tsp_bruteforce(
     best_order = None
     best_distance = float('inf')
     
-    # Try all permutations
     for perm in permutations(range(len(stop_coords))):
         total_km = 0.0
         
@@ -154,8 +193,8 @@ def solve_tsp_bruteforce(
 def solve_tsp_nearest_neighbor(
     home_coords: Tuple[float, float],
     stop_coords: List[Tuple[float, float]],
-    stop_ids: List[str]
-) -> Tuple[List[str], float]:
+    stop_ids: List[int]
+) -> Tuple[List[int], float]:
     """
     Solve TSP via nearest neighbor heuristic for larger stop counts.
     Fast but not always optimal - good enough for 8+ stops.
@@ -169,7 +208,6 @@ def solve_tsp_nearest_neighbor(
     
     current_lat, current_lng = home_coords
     
-    # Greedily pick nearest unvisited stop
     while remaining:
         best_idx = None
         best_dist = float('inf')
@@ -195,8 +233,8 @@ def solve_tsp_nearest_neighbor(
 def solve_tsp(
     home_coords: Tuple[float, float],
     stop_coords: List[Tuple[float, float]],
-    stop_ids: List[str]
-) -> Tuple[List[str], float]:
+    stop_ids: List[int]
+) -> Tuple[List[int], float]:
     """
     Solve TSP - picks algorithm based on stop count.
     ≤7 stops: brute force (optimal)
@@ -297,54 +335,59 @@ def fetch_inspector_data(inspector_id: str, date: str) -> Optional[Dict]:
     }
 
 
-def fetch_inspection_data(inspection_ids: List[str]) -> List[Dict]:
-    """Fetch inspection details including coordinates and durations"""
+def fetch_monday_items(item_ids: List[int]) -> List[Dict]:
+    """
+    Fetch inspection details from monday_items_selected table.
     
-    if not inspection_ids:
+    Args:
+        item_ids: List of monday_items_selected.id values (bigint)
+    
+    Returns:
+        List of inspection dicts with coordinates and durations
+    """
+    if not item_ids:
         return []
     
-    result = supabase.table('inspection_queue')\
-        .select('id, address, inspection_type, rooms, lat, lng')\
-        .in_('id', inspection_ids)\
+    print(f"  📋 Fetching {len(item_ids)} items from monday_items_selected...")
+    
+    result = supabase.table('monday_items_selected')\
+        .select('id, adresse, synstype, antal_vaerelser, lat, lng, dato_tid')\
+        .in_('id', item_ids)\
         .execute()
     
     inspections = []
+    missing_coords = []
     
-    for ins in (result.data or []):
-        if not ins.get('lat') or not ins.get('lng'):
-            print(f"  ⚠️ Skipping inspection {ins.get('address', '?')} - missing coordinates")
+    for item in (result.data or []):
+        # Check for coordinates
+        if not item.get('lat') or not item.get('lng'):
+            missing_coords.append(item.get('adresse', f"ID: {item['id']}"))
             continue
         
-        # Get duration
-        duration = 45  # default
-        
-        mapping_result = supabase.table('inspection_type_mappings')\
-            .select('abbreviation')\
-            .eq('full_name', ins['inspection_type'])\
-            .execute()
-        
-        if mapping_result.data and len(mapping_result.data) > 0:
-            abbrev = mapping_result.data[0]['abbreviation']
-            
-            duration_result = supabase.table('inspection_durations')\
-                .select('minutes')\
-                .eq('inspection_type', abbrev)\
-                .eq('rooms', ins['rooms'])\
-                .execute()
-            
-            if duration_result.data and len(duration_result.data) > 0:
-                duration = duration_result.data[0]['minutes']
+        # Get duration based on type and rooms
+        inspection_type = item.get('synstype', 'Indflytningssyn')
+        rooms = item.get('antal_vaerelser', 3)
+        duration = get_inspection_duration(inspection_type, rooms)
         
         inspections.append({
-            'id': ins['id'],
-            'address': ins.get('address', 'Ukendt adresse'),
-            'inspection_type': ins['inspection_type'],
-            'rooms': ins['rooms'],
-            'lat': ins['lat'],
-            'lng': ins['lng'],
-            'duration_minutes': duration
+            'id': item['id'],  # Keep as integer for monday_items_selected
+            'address': item.get('adresse', 'Ukendt adresse'),
+            'inspection_type': inspection_type,
+            'rooms': rooms,
+            'lat': item['lat'],
+            'lng': item['lng'],
+            'duration_minutes': duration,
+            'preferred_date': item.get('dato_tid')
         })
     
+    if missing_coords:
+        print(f"  ⚠️ Skipping {len(missing_coords)} items without coordinates:")
+        for addr in missing_coords[:5]:  # Show first 5
+            print(f"      - {addr}")
+        if len(missing_coords) > 5:
+            print(f"      ... and {len(missing_coords) - 5} more")
+    
+    print(f"  ✅ Loaded {len(inspections)} items with coordinates")
     return inspections
 
 
@@ -367,20 +410,13 @@ def optimize_inspector_routes(
         date: Target date (YYYY-MM-DD format)
         assignments: List of dicts with format:
             [
-                {"inspector_id": "uuid", "inspection_ids": ["uuid1", "uuid2", ...]},
+                {"inspector_id": "uuid", "inspection_ids": [123, 456, ...]},  # monday_items_selected.id
                 ...
             ]
         save_to_db: Whether to save results to proposed_assignments table
     
     Returns:
-        Dict with:
-            - status: 'success' or 'error'
-            - vrp_run_id: ID of saved run (if save_to_db=True)
-            - routes: List of optimized routes per inspector
-            - metrics: Total km, travel minutes, etc.
-            - errors: Any issues encountered
-    
-    Expected performance: <2 seconds for typical workloads
+        Dict with routes, metrics, and any errors
     """
     
     start_time = datetime.now()
@@ -395,7 +431,7 @@ def optimize_inspector_routes(
     day_midnight = tz.localize(datetime.combine(base_date, datetime.min.time()))
     
     all_routes = []
-    all_assignments = []
+    all_db_assignments = []  # For saving to proposed_assignments
     errors = []
     
     total_km = 0.0
@@ -414,6 +450,13 @@ def optimize_inspector_routes(
             print(f"  ⚠️ No inspections for inspector {inspector_id}")
             continue
         
+        # Convert inspection_ids to integers (they come from monday_items_selected.id)
+        try:
+            inspection_ids = [int(id) for id in inspection_ids]
+        except (ValueError, TypeError) as e:
+            errors.append(f"Invalid inspection_ids format: {e}")
+            continue
+        
         # Fetch inspector data
         inspector = fetch_inspector_data(inspector_id, date)
         if not inspector:
@@ -424,13 +467,13 @@ def optimize_inspector_routes(
         print(f"   Home: {inspector['home_address']}")
         print(f"   Available from: {inspector['available_start_min'] // 60:02d}:{inspector['available_start_min'] % 60:02d}")
         
-        # Fetch inspection data
-        inspections = fetch_inspection_data(inspection_ids)
+        # Fetch inspection data from monday_items_selected
+        inspections = fetch_monday_items(inspection_ids)
         if not inspections:
             errors.append(f"No valid inspections found for {inspector['full_name']}")
             continue
         
-        print(f"   Inspections: {len(inspections)}")
+        print(f"   Inspections to route: {len(inspections)}")
         
         # Build coordinates for TSP
         home_coords = (inspector['home_lat'], inspector['home_lng'])
@@ -476,23 +519,10 @@ def optimize_inspector_routes(
             end_min = current_min + duration
             end_dt = day_midnight + timedelta(minutes=end_min)
             
-            # Build assignment record
-            assignment_record = {
-                'inspection_id': ins['id'],
-                'inspector_id': inspector_id,
-                'scheduled_date': date,
-                'start_time': start_dt.time().isoformat(),
-                'end_time': end_dt.time().isoformat(),
-                'sequence_in_route': seq,
-                'travel_from_previous_mins': travel_min,
-                'inspector_route_km': round(route_km, 1)
-            }
-            all_assignments.append(assignment_record)
-            
             # Build route stop for response
             route_stop = {
                 'sequence': seq,
-                'inspection_id': ins['id'],
+                'monday_item_id': ins['id'],  # Return the monday_items_selected.id
                 'address': ins['address'],
                 'inspection_type': ins['inspection_type'],
                 'rooms': ins['rooms'],
@@ -547,50 +577,15 @@ def optimize_inspector_routes(
     print(f"   Execution time: {execution_seconds:.3f}s")
     print(f"{'='*60}")
     
-    # Save to database if requested
-    vrp_run_id = None
-    if save_to_db and all_assignments:
-        vrp_run_id = save_optimized_routes(date, all_assignments, metrics)
-        print(f"   VRP Run ID: {vrp_run_id}")
+    # Note: We're NOT saving to proposed_assignments anymore since that table
+    # expects inspection_queue UUIDs. The frontend should update monday_items_selected directly.
     
     return {
         'status': 'success' if not errors else 'partial',
-        'vrp_run_id': vrp_run_id,
         'routes': all_routes,
         'metrics': metrics,
         'errors': errors if errors else None
     }
-
-
-def save_optimized_routes(date: str, assignments: List[Dict], metrics: Dict) -> str:
-    """Save optimized routes to database"""
-    
-    run_id = str(uuid.uuid4())
-    
-    # Create VRP run record
-    vrp_run_data = {
-        'id': run_id,
-        'inspection_ids': list(set(a['inspection_id'] for a in assignments)),
-        'target_dates': [date],
-        'status': 'COMPLETED',
-        'num_inspections_scheduled': metrics['total_scheduled'],
-        'total_travel_minutes': metrics['total_travel_minutes'],
-        'total_travel_km': metrics['total_travel_km'],
-        'execution_seconds': metrics['execution_seconds'],
-        'requested_by': 'manual_assignment',
-        'triggered_by': 'route_optimizer'
-    }
-    
-    supabase.table('vrp_runs').insert(vrp_run_data).execute()
-    
-    # Save individual assignments
-    for assignment in assignments:
-        supabase.table('proposed_assignments').insert({
-            'vrp_run_id': run_id,
-            **assignment
-        }).execute()
-    
-    return run_id
 
 
 # ============================================================================
