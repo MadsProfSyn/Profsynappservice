@@ -1,0 +1,195 @@
+/**
+ * useRouteOptimizer.ts
+ * 
+ * React hook for the lightweight route optimizer service.
+ * Place this in your hooks folder (e.g., src/hooks/useRouteOptimizer.ts)
+ * 
+ * Usage:
+ *   const { optimizeRoutes, previewRoutes, isLoading, error } = useRouteOptimizer();
+ *   
+ *   // Preview as user drags (debounced)
+ *   const preview = await previewRoutes('2026-01-02', assignments);
+ *   
+ *   // Save when user confirms
+ *   const result = await optimizeRoutes('2026-01-02', assignments);
+ */
+
+import { useState, useCallback } from 'react';
+
+// ============================================================================
+// TYPES
+// ============================================================================
+
+export interface Assignment {
+  inspector_id: string;
+  inspection_ids: string[];
+}
+
+export interface RouteStop {
+  sequence: number;
+  inspection_id: string;
+  address: string;
+  inspection_type: string;
+  rooms: number;
+  start_time: string;  // "09:00"
+  end_time: string;    // "09:45"
+  duration_minutes: number;
+  travel_from_previous_mins: number;
+}
+
+export interface InspectorRoute {
+  inspector_id: string;
+  inspector_name: string;
+  home_address: string;
+  total_inspections: number;
+  total_km: number;
+  total_travel_minutes: number;
+  start_time: string | null;
+  end_time: string | null;
+  stops: RouteStop[];
+}
+
+export interface RouteMetrics {
+  total_scheduled: number;
+  total_inspectors: number;
+  total_travel_km: number;
+  total_travel_minutes: number;
+  execution_seconds: number;
+}
+
+export interface OptimizeResult {
+  status: 'success' | 'partial' | 'error';
+  vrp_run_id: string | null;
+  routes: InspectorRoute[];
+  metrics: RouteMetrics;
+  errors: string[] | null;
+}
+
+// ============================================================================
+// CONFIGURATION
+// ============================================================================
+
+// Update this to your Railway service URL after deployment
+const ROUTE_OPTIMIZER_URL = 
+  import.meta.env.VITE_ROUTE_OPTIMIZER_URL || 
+  'http://localhost:8080';
+
+// ============================================================================
+// HOOK
+// ============================================================================
+
+export function useRouteOptimizer() {
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  /**
+   * Optimize routes and save to database.
+   * Call this when user clicks "Bekræft" or "Gem planlægning"
+   */
+  const optimizeRoutes = useCallback(async (
+    date: string, 
+    assignments: Assignment[]
+  ): Promise<OptimizeResult | null> => {
+    setIsLoading(true);
+    setError(null);
+
+    try {
+      const response = await fetch(`${ROUTE_OPTIMIZER_URL}/optimize-routes`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ date, assignments }),
+      });
+
+      const result = await response.json();
+
+      if (!response.ok) {
+        throw new Error(result.error || 'Failed to optimize routes');
+      }
+
+      return result as OptimizeResult;
+
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Unknown error';
+      setError(message);
+      console.error('Route optimization failed:', err);
+      return null;
+    } finally {
+      setIsLoading(false);
+    }
+  }, []);
+
+  /**
+   * Preview routes without saving to database.
+   * Use this for real-time preview as user drags inspections.
+   * 
+   * Tip: Debounce calls to this function (300-500ms)
+   */
+  const previewRoutes = useCallback(async (
+    date: string, 
+    assignments: Assignment[]
+  ): Promise<OptimizeResult | null> => {
+    // Don't set loading state for preview to avoid UI flickering
+    try {
+      const response = await fetch(`${ROUTE_OPTIMIZER_URL}/preview-routes`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ date, assignments }),
+      });
+
+      if (!response.ok) {
+        return null;  // Silently fail for preview
+      }
+
+      return await response.json() as OptimizeResult;
+
+    } catch (err) {
+      console.warn('Route preview failed:', err);
+      return null;
+    }
+  }, []);
+
+  /**
+   * Clear any error state
+   */
+  const clearError = useCallback(() => {
+    setError(null);
+  }, []);
+
+  return {
+    optimizeRoutes,
+    previewRoutes,
+    isLoading,
+    error,
+    clearError,
+  };
+}
+
+// ============================================================================
+// UTILITY: Convert your UI state to Assignment format
+// ============================================================================
+
+/**
+ * Helper to convert your drag & drop state to the API format.
+ * Adjust this based on your actual state structure.
+ * 
+ * Example usage:
+ *   const assignments = buildAssignments(inspectorCards);
+ *   const result = await optimizeRoutes(date, assignments);
+ */
+export function buildAssignments(
+  inspectorAssignments: Array<{
+    inspectorId: string;
+    inspections: Array<{ id: string }>;
+  }>
+): Assignment[] {
+  return inspectorAssignments
+    .filter(ia => ia.inspections.length > 0)
+    .map(ia => ({
+      inspector_id: ia.inspectorId,
+      inspection_ids: ia.inspections.map(ins => ins.id),
+    }));
+}
