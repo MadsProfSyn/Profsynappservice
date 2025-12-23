@@ -20,13 +20,7 @@ import traceback
 app = Flask(__name__)
 
 # Configure CORS - update with your actual frontend domains
-CORS(app, origins=[
-    "http://localhost:3000",
-    "http://localhost:5173",
-    "https://*.lovable.app",
-    "https://*.vercel.app",
-    # Add your production domain here
-])
+CORS(app)  # Allow all origins
 
 # Track service status
 service_status = {
