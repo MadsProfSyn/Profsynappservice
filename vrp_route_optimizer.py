@@ -72,14 +72,25 @@ def get_cached_travel_time(from_lat: float, from_lng: float,
     if from_lat == to_lat and from_lng == to_lng:
         return 0.0
     
-    key = f"{from_lng},{from_lat}->{to_lng},{to_lat}"
+    # Round to 5 decimal places to match Edge Function cache keys
+    from_lng_r = round(from_lng, 5)
+    from_lat_r = round(from_lat, 5)
+    to_lng_r = round(to_lng, 5)
+    to_lat_r = round(to_lat, 5)
+    
+    # Format key with exactly 5 decimal places (matching Edge Function format)
+    key = f"{from_lng_r:.5f},{from_lat_r:.5f}->{to_lng_r:.5f},{to_lat_r:.5f}"
     
     try:
         result = supabase.table('mapbox_travel_cache').select('minutes').eq('key', key).execute()
         if result.data and len(result.data) > 0 and result.data[0].get('minutes') is not None:
-            return max(5.0, float(result.data[0]['minutes']))
-    except Exception:
-        pass
+            cached_minutes = float(result.data[0]['minutes'])
+            print(f"  ✅ Cache HIT: {key} = {cached_minutes} min")
+            return max(5.0, cached_minutes)
+        else:
+            print(f"  ⚠️ Cache MISS: {key}")
+    except Exception as e:
+        print(f"  ❌ Cache error: {e}")
     
     return estimate_travel_minutes(from_lat, from_lng, to_lat, to_lng)
 
