@@ -5,6 +5,7 @@ This module solves ONLY the routing problem (TSP) when inspections have already
 been assigned to inspectors by the user via drag & drop UI.
 
 UPDATED: Now works directly with monday_items_selected table (not inspection_queue)
+UPDATED: Uses cached Mapbox distance_km for accurate route totals
 
 Expected performance: <2 seconds for typical workloads (2-5 inspectors, 3-7 inspections each)
 """
@@ -34,7 +35,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 # ============================================================================
 
 def haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
-    """Calculate distance in km between two coordinates"""
+    """Calculate distance in km between two coordinates (straight line)"""
     R = 6371.0
     dlat = math.radians(lat2 - lat1)
     dlng = math.radians(lng2 - lng1)
@@ -66,33 +67,67 @@ def estimate_travel_minutes(lat1: float, lng1: float, lat2: float, lng2: float) 
     return max(5.0, minutes)  # Minimum 5 minutes
 
 
-def get_cached_travel_time(from_lat: float, from_lng: float, 
-                           to_lat: float, to_lng: float) -> float:
-    """Get cached travel time or return estimate (minutes)."""
-    if from_lat == to_lat and from_lng == to_lng:
-        return 0.0
-    
-    # Round to 5 decimal places to match Edge Function cache keys
+def make_cache_key(from_lat: float, from_lng: float, to_lat: float, to_lng: float) -> str:
+    """Create standardized cache key with 5 decimal precision"""
     from_lng_r = round(from_lng, 5)
     from_lat_r = round(from_lat, 5)
     to_lng_r = round(to_lng, 5)
     to_lat_r = round(to_lat, 5)
+    return f"{from_lng_r:.5f},{from_lat_r:.5f}->{to_lng_r:.5f},{to_lat_r:.5f}"
+
+
+def get_cached_travel_data(from_lat: float, from_lng: float, 
+                           to_lat: float, to_lng: float) -> Tuple[float, float]:
+    """
+    Get cached travel time (minutes) and distance (km) from Mapbox cache.
+    Returns (minutes, km) tuple. Falls back to estimates if cache miss.
+    """
+    if from_lat == to_lat and from_lng == to_lng:
+        return 0.0, 0.0
     
-    # Format key with exactly 5 decimal places (matching Edge Function format)
-    key = f"{from_lng_r:.5f},{from_lat_r:.5f}->{to_lng_r:.5f},{to_lat_r:.5f}"
+    key = make_cache_key(from_lat, from_lng, to_lat, to_lng)
     
     try:
-        result = supabase.table('mapbox_travel_cache').select('minutes').eq('key', key).execute()
-        if result.data and len(result.data) > 0 and result.data[0].get('minutes') is not None:
-            cached_minutes = float(result.data[0]['minutes'])
-            print(f"  ✅ Cache HIT: {key} = {cached_minutes} min")
-            return max(5.0, cached_minutes)
-        else:
-            print(f"  ⚠️ Cache MISS: {key}")
+        result = supabase.table('mapbox_travel_cache')\
+            .select('minutes, distance_km')\
+            .eq('key', key)\
+            .execute()
+        
+        if result.data and len(result.data) > 0:
+            row = result.data[0]
+            cached_minutes = float(row['minutes']) if row.get('minutes') is not None else None
+            cached_km = float(row['distance_km']) if row.get('distance_km') is not None else None
+            
+            if cached_minutes is not None:
+                # If we have minutes but no km, estimate km from Haversine * 1.3 (road factor)
+                if cached_km is None:
+                    cached_km = haversine_km(from_lat, from_lng, to_lat, to_lng) * 1.3
+                
+                print(f"  ✅ Cache HIT: {key} = {cached_minutes} min, {cached_km:.1f} km")
+                return max(5.0, cached_minutes), cached_km
+        
+        print(f"  ⚠️ Cache MISS: {key}")
     except Exception as e:
         print(f"  ❌ Cache error: {e}")
     
-    return estimate_travel_minutes(from_lat, from_lng, to_lat, to_lng)
+    # Fallback to estimates
+    est_minutes = estimate_travel_minutes(from_lat, from_lng, to_lat, to_lng)
+    est_km = haversine_km(from_lat, from_lng, to_lat, to_lng) * 1.3  # Road factor
+    return est_minutes, est_km
+
+
+def get_cached_travel_time(from_lat: float, from_lng: float, 
+                           to_lat: float, to_lng: float) -> float:
+    """Get cached travel time or return estimate (minutes). For backwards compatibility."""
+    minutes, _ = get_cached_travel_data(from_lat, from_lng, to_lat, to_lng)
+    return minutes
+
+
+def get_cached_distance_km(from_lat: float, from_lng: float, 
+                           to_lat: float, to_lng: float) -> float:
+    """Get cached distance or return estimate (km)."""
+    _, km = get_cached_travel_data(from_lat, from_lng, to_lat, to_lng)
+    return km
 
 
 def round_to_nearest_5_min(dt: datetime) -> datetime:
@@ -156,14 +191,15 @@ def solve_tsp_bruteforce(
     Returns optimal order of stop_ids and total distance in km.
     
     Route: home → stops (in optimal order) → home
+    Uses cached Mapbox distances when available.
     """
     if len(stop_coords) == 0:
         return [], 0.0
     
     if len(stop_coords) == 1:
-        km = haversine_km(home_coords[0], home_coords[1], stop_coords[0][0], stop_coords[0][1])
-        km += haversine_km(stop_coords[0][0], stop_coords[0][1], home_coords[0], home_coords[1])
-        return [stop_ids[0]], km
+        km_to = get_cached_distance_km(home_coords[0], home_coords[1], stop_coords[0][0], stop_coords[0][1])
+        km_back = get_cached_distance_km(stop_coords[0][0], stop_coords[0][1], home_coords[0], home_coords[1])
+        return [stop_ids[0]], km_to + km_back
     
     best_order = None
     best_distance = float('inf')
@@ -173,7 +209,7 @@ def solve_tsp_bruteforce(
         
         # Home to first stop
         first_idx = perm[0]
-        total_km += haversine_km(
+        total_km += get_cached_distance_km(
             home_coords[0], home_coords[1],
             stop_coords[first_idx][0], stop_coords[first_idx][1]
         )
@@ -182,14 +218,14 @@ def solve_tsp_bruteforce(
         for i in range(len(perm) - 1):
             from_idx = perm[i]
             to_idx = perm[i + 1]
-            total_km += haversine_km(
+            total_km += get_cached_distance_km(
                 stop_coords[from_idx][0], stop_coords[from_idx][1],
                 stop_coords[to_idx][0], stop_coords[to_idx][1]
             )
         
         # Last stop to home
         last_idx = perm[-1]
-        total_km += haversine_km(
+        total_km += get_cached_distance_km(
             stop_coords[last_idx][0], stop_coords[last_idx][1],
             home_coords[0], home_coords[1]
         )
@@ -209,6 +245,7 @@ def solve_tsp_nearest_neighbor(
     """
     Solve TSP via nearest neighbor heuristic for larger stop counts.
     Fast but not always optimal - good enough for 8+ stops.
+    Uses cached Mapbox distances when available.
     """
     if len(stop_coords) == 0:
         return [], 0.0
@@ -224,8 +261,8 @@ def solve_tsp_nearest_neighbor(
         best_dist = float('inf')
         
         for idx in remaining:
-            dist = haversine_km(current_lat, current_lng, 
-                               stop_coords[idx][0], stop_coords[idx][1])
+            dist = get_cached_distance_km(current_lat, current_lng, 
+                                          stop_coords[idx][0], stop_coords[idx][1])
             if dist < best_dist:
                 best_dist = dist
                 best_idx = idx
@@ -236,7 +273,7 @@ def solve_tsp_nearest_neighbor(
         remaining.remove(best_idx)
     
     # Return to home
-    total_km += haversine_km(current_lat, current_lng, home_coords[0], home_coords[1])
+    total_km += get_cached_distance_km(current_lat, current_lng, home_coords[0], home_coords[1])
     
     return [stop_ids[idx] for idx in route_indices], total_km
 
@@ -494,31 +531,36 @@ def optimize_inspector_routes(
         # Create lookup by ID
         inspection_by_id = {ins['id']: ins for ins in inspections}
         
-        # Solve TSP
+        # Solve TSP - now uses cached Mapbox distances
         optimal_order, route_km = solve_tsp(home_coords, stop_coords, stop_ids)
         
-        print(f"   Optimal route: {route_km:.1f} km")
+        print(f"   Optimal route: {route_km:.1f} km (including return home)")
         total_km += route_km
         
         # Build schedule with times
         current_min = inspector['available_start_min']
         route_stops = []
         prev_coords = home_coords
+        route_km_running = 0.0  # Track km as we build route
         
         for seq, inspection_id in enumerate(optimal_order, start=1):
             ins = inspection_by_id[inspection_id]
             ins_coords = (ins['lat'], ins['lng'])
             
-            # Calculate travel time from previous location
+            # Calculate travel time and distance from previous location
             if seq == 1:
-                # First stop: no travel time consumed (starts at available time)
+                # First stop: travel from home (doesn't consume day time but counts in km)
                 travel_min = 0
+                leg_km = get_cached_distance_km(prev_coords[0], prev_coords[1], ins_coords[0], ins_coords[1])
             else:
-                travel_min = int(round(get_cached_travel_time(
+                travel_min, leg_km = get_cached_travel_data(
                     prev_coords[0], prev_coords[1],
                     ins_coords[0], ins_coords[1]
-                )))
+                )
+                travel_min = int(round(travel_min))
                 current_min += travel_min
+            
+            route_km_running += leg_km
             
             # Round start time to nearest 5 min
             start_dt = day_midnight + timedelta(minutes=current_min)
@@ -540,12 +582,13 @@ def optimize_inspector_routes(
                 'start_time': start_dt.strftime('%H:%M'),
                 'end_time': end_dt.strftime('%H:%M'),
                 'duration_minutes': duration,
-                'travel_from_previous_mins': travel_min
+                'travel_from_previous_mins': travel_min,
+                'distance_from_previous_km': round(leg_km, 1)
             }
             route_stops.append(route_stop)
             
             print(f"      {seq}. {ins['address'][:40]}")
-            print(f"         {start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')} ({duration}m) | Travel: {travel_min}m")
+            print(f"         {start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')} ({duration}m) | Travel: {travel_min}m, {leg_km:.1f}km")
             
             total_travel_minutes += travel_min
             total_scheduled += 1
@@ -554,13 +597,20 @@ def optimize_inspector_routes(
             current_min = end_min
             prev_coords = ins_coords
         
+        # Calculate return to home distance
+        return_home_km = get_cached_distance_km(prev_coords[0], prev_coords[1], home_coords[0], home_coords[1])
+        route_km_running += return_home_km
+        print(f"      → Return home: {return_home_km:.1f} km")
+        print(f"      Total route: {route_km_running:.1f} km")
+        
         # Build route summary
         route_summary = {
             'inspector_id': inspector_id,
             'inspector_name': inspector['full_name'],
             'home_address': inspector['home_address'],
             'total_inspections': len(route_stops),
-            'total_km': round(route_km, 1),
+            'total_km': round(route_km_running, 1),  # Now includes return home
+            'return_home_km': round(return_home_km, 1),
             'total_travel_minutes': sum(s['travel_from_previous_mins'] for s in route_stops),
             'start_time': route_stops[0]['start_time'] if route_stops else None,
             'end_time': route_stops[-1]['end_time'] if route_stops else None,
@@ -584,7 +634,7 @@ def optimize_inspector_routes(
     print(f"✅ Route optimization complete")
     print(f"   Scheduled: {total_scheduled} inspections")
     print(f"   Inspectors: {len(all_routes)}")
-    print(f"   Total km: {total_km:.1f}")
+    print(f"   Total km: {total_km:.1f} (including return home)")
     print(f"   Execution time: {execution_seconds:.3f}s")
     print(f"{'='*60}")
     
