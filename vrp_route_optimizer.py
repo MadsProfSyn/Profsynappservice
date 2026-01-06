@@ -8,6 +8,7 @@ UPDATED: Now works directly with monday_items_selected table (not inspection_que
 UPDATED: Uses cached Mapbox distance_km for accurate route totals
 UPDATED: Supports existing_ids - inspections that are already scheduled and should keep their times
 UPDATED: Calls Mapbox Directions API on cache miss (no more Haversine fallback)
+UPDATED: Supports fixed_stops - booked shifts passed by coordinates (Option B)
 
 Expected performance: <2 seconds for typical workloads (2-5 inspectors, 3-7 inspections each)
 """
@@ -19,7 +20,7 @@ from datetime import datetime, timedelta
 from itertools import permutations
 from typing import List, Dict, Tuple, Optional
 import pytz
-import requests  # <-- ADDED: for Mapbox API calls
+import requests
 from supabase import create_client, Client
 from dotenv import load_dotenv
 
@@ -27,12 +28,11 @@ load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
-MAPBOX_TOKEN = os.getenv("MAPBOX_TOKEN")  # <-- ADDED: Mapbox API token
+MAPBOX_TOKEN = os.getenv("MAPBOX_TOKEN")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise ValueError("Missing SUPABASE_URL or SUPABASE_SERVICE_KEY environment variables")
 
-# <-- ADDED: Warning if no Mapbox token (will fall back to estimates)
 if not MAPBOX_TOKEN:
     print("⚠️ WARNING: MAPBOX_TOKEN not set - will use Haversine estimates on cache miss")
 
@@ -85,10 +85,6 @@ def make_cache_key(from_lat: float, from_lng: float, to_lat: float, to_lng: floa
     return f"{from_lng_r:.5f},{from_lat_r:.5f}->{to_lng_r:.5f},{to_lat_r:.5f}"
 
 
-# ============================================================================
-# ADDED: Mapbox Directions API call function
-# ============================================================================
-
 def fetch_mapbox_directions(from_lat: float, from_lng: float, 
                             to_lat: float, to_lng: float) -> Tuple[Optional[float], Optional[float]]:
     """
@@ -101,7 +97,7 @@ def fetch_mapbox_directions(from_lat: float, from_lng: float,
     url = f"https://api.mapbox.com/directions/v5/mapbox/driving/{from_lng},{from_lat};{to_lng},{to_lat}"
     params = {
         'access_token': MAPBOX_TOKEN,
-        'overview': 'false'  # We don't need the route geometry
+        'overview': 'false'
     }
     
     try:
@@ -130,10 +126,6 @@ def fetch_mapbox_directions(from_lat: float, from_lng: float,
         return None, None
 
 
-# ============================================================================
-# MODIFIED: get_cached_travel_data - now calls Mapbox API on cache miss
-# ============================================================================
-
 def get_cached_travel_data(from_lat: float, from_lng: float, 
                            to_lat: float, to_lng: float) -> Tuple[float, float]:
     """
@@ -159,7 +151,6 @@ def get_cached_travel_data(from_lat: float, from_lng: float,
             cached_km = float(row['distance_km']) if row.get('distance_km') is not None else None
             
             if cached_minutes is not None:
-                # If we have minutes but no km, estimate km from Haversine * 1.3 (road factor)
                 if cached_km is None:
                     cached_km = haversine_km(from_lat, from_lng, to_lat, to_lng) * 1.3
                 
@@ -170,7 +161,7 @@ def get_cached_travel_data(from_lat: float, from_lng: float,
     except Exception as e:
         print(f"  ❌ Cache error: {e}")
     
-    # Step 2: Cache miss - call Mapbox API (NEW!)
+    # Step 2: Cache miss - call Mapbox API
     mapbox_minutes, mapbox_km = fetch_mapbox_directions(from_lat, from_lng, to_lat, to_lng)
     
     if mapbox_minutes is not None and mapbox_km is not None:
@@ -188,10 +179,10 @@ def get_cached_travel_data(from_lat: float, from_lng: float,
         
         return max(5.0, mapbox_minutes), mapbox_km
     
-    # Step 3: Last resort fallback - Haversine estimates (only if Mapbox API fails)
+    # Step 3: Last resort fallback - Haversine estimates
     print(f"  ⚠️ Using Haversine fallback for: {key}")
     est_minutes = estimate_travel_minutes(from_lat, from_lng, to_lat, to_lng)
-    est_km = haversine_km(from_lat, from_lng, to_lat, to_lng) * 1.3  # Road factor
+    est_km = haversine_km(from_lat, from_lng, to_lat, to_lng) * 1.3
     return est_minutes, est_km
 
 
@@ -237,7 +228,6 @@ def get_inspection_duration(inspection_type: str, rooms: int) -> int:
     Get inspection duration in minutes based on type and room count.
     Falls back to default if not found.
     """
-    # Map Danish inspection types to abbreviations
     type_mapping = {
         'Proforma': 'PA',
         'Projektsyn': 'PS', 
@@ -262,7 +252,6 @@ def get_inspection_duration(inspection_type: str, rooms: int) -> int:
     except Exception as e:
         print(f"  ⚠️ Error fetching duration: {e}")
     
-    # Default durations by type
     defaults = {'PA': 30, 'PS': 45, 'IF': 45, 'FF': 60}
     return defaults.get(abbrev, 45)
 
@@ -279,9 +268,6 @@ def solve_tsp_bruteforce(
     """
     Solve TSP via brute force for small number of stops (≤7).
     Returns optimal order of stop_ids and total distance in km.
-    
-    Route: home → stops (in optimal order) → home
-    Uses cached Mapbox distances when available.
     """
     if len(stop_coords) == 0:
         return [], 0.0
@@ -297,14 +283,12 @@ def solve_tsp_bruteforce(
     for perm in permutations(range(len(stop_coords))):
         total_km = 0.0
         
-        # Home to first stop
         first_idx = perm[0]
         total_km += get_cached_distance_km(
             home_coords[0], home_coords[1],
             stop_coords[first_idx][0], stop_coords[first_idx][1]
         )
         
-        # Between stops
         for i in range(len(perm) - 1):
             from_idx = perm[i]
             to_idx = perm[i + 1]
@@ -313,7 +297,6 @@ def solve_tsp_bruteforce(
                 stop_coords[to_idx][0], stop_coords[to_idx][1]
             )
         
-        # Last stop to home
         last_idx = perm[-1]
         total_km += get_cached_distance_km(
             stop_coords[last_idx][0], stop_coords[last_idx][1],
@@ -334,8 +317,6 @@ def solve_tsp_nearest_neighbor(
 ) -> Tuple[List[int], float]:
     """
     Solve TSP via nearest neighbor heuristic for larger stop counts.
-    Fast but not always optimal - good enough for 8+ stops.
-    Uses cached Mapbox distances when available.
     """
     if len(stop_coords) == 0:
         return [], 0.0
@@ -362,7 +343,6 @@ def solve_tsp_nearest_neighbor(
         current_lat, current_lng = stop_coords[best_idx]
         remaining.remove(best_idx)
     
-    # Return to home
     total_km += get_cached_distance_km(current_lat, current_lng, home_coords[0], home_coords[1])
     
     return [stop_ids[idx] for idx in route_indices], total_km
@@ -375,13 +355,100 @@ def solve_tsp(
 ) -> Tuple[List[int], float]:
     """
     Solve TSP - picks algorithm based on stop count.
-    ≤7 stops: brute force (optimal)
-    >7 stops: nearest neighbor (fast heuristic)
     """
     if len(stop_coords) <= 7:
         return solve_tsp_bruteforce(home_coords, stop_coords, stop_ids)
     else:
         return solve_tsp_nearest_neighbor(home_coords, stop_coords, stop_ids)
+
+
+# ============================================================================
+# OPTION B: TSP with custom starting point (for fixed_stops support)
+# ============================================================================
+
+def solve_tsp_from_point(
+    start_coords: Tuple[float, float],
+    home_coords: Tuple[float, float],
+    stop_coords: List[Tuple[float, float]],
+    stop_ids: List[int]
+) -> Tuple[List[int], float]:
+    """
+    Solve TSP starting from a specific point (not home).
+    Route: start_coords → stops (in optimal order) → home
+    
+    OPTION B: Used when there are fixed_stops - we start from the last fixed stop.
+    """
+    if len(stop_coords) == 0:
+        return [], 0.0
+    
+    if len(stop_coords) == 1:
+        km_to = get_cached_distance_km(start_coords[0], start_coords[1], stop_coords[0][0], stop_coords[0][1])
+        km_back = get_cached_distance_km(stop_coords[0][0], stop_coords[0][1], home_coords[0], home_coords[1])
+        return [stop_ids[0]], km_to + km_back
+    
+    # For small number of stops, use brute force
+    if len(stop_coords) <= 7:
+        best_order = None
+        best_distance = float('inf')
+        
+        for perm in permutations(range(len(stop_coords))):
+            total_km = 0.0
+            
+            # Start point to first stop
+            first_idx = perm[0]
+            total_km += get_cached_distance_km(
+                start_coords[0], start_coords[1],
+                stop_coords[first_idx][0], stop_coords[first_idx][1]
+            )
+            
+            # Between stops
+            for i in range(len(perm) - 1):
+                from_idx = perm[i]
+                to_idx = perm[i + 1]
+                total_km += get_cached_distance_km(
+                    stop_coords[from_idx][0], stop_coords[from_idx][1],
+                    stop_coords[to_idx][0], stop_coords[to_idx][1]
+                )
+            
+            # Last stop to home
+            last_idx = perm[-1]
+            total_km += get_cached_distance_km(
+                stop_coords[last_idx][0], stop_coords[last_idx][1],
+                home_coords[0], home_coords[1]
+            )
+            
+            if total_km < best_distance:
+                best_distance = total_km
+                best_order = [stop_ids[idx] for idx in perm]
+        
+        return best_order, best_distance
+    else:
+        # Nearest neighbor for larger counts
+        remaining = list(range(len(stop_coords)))
+        route_indices = []
+        total_km = 0.0
+        
+        current_lat, current_lng = start_coords
+        
+        while remaining:
+            best_idx = None
+            best_dist = float('inf')
+            
+            for idx in remaining:
+                dist = get_cached_distance_km(current_lat, current_lng, 
+                                              stop_coords[idx][0], stop_coords[idx][1])
+                if dist < best_dist:
+                    best_dist = dist
+                    best_idx = idx
+            
+            route_indices.append(best_idx)
+            total_km += best_dist
+            current_lat, current_lng = stop_coords[best_idx]
+            remaining.remove(best_idx)
+        
+        total_km += get_cached_distance_km(current_lat, current_lng, home_coords[0], home_coords[1])
+        
+        return [stop_ids[idx] for idx in route_indices], total_km
 
 
 # ============================================================================
@@ -391,7 +458,6 @@ def solve_tsp(
 def fetch_inspector_data(inspector_id: str, date: str) -> Optional[Dict]:
     """Fetch inspector's home location and availability for date"""
     
-    # Get inspector base info
     result = supabase.table('inspectors')\
         .select('id, full_name, address, lat, lng')\
         .eq('id', inspector_id)\
@@ -405,7 +471,6 @@ def fetch_inspector_data(inspector_id: str, date: str) -> Optional[Dict]:
     if not inspector.get('lat') or not inspector.get('lng'):
         return None
     
-    # Get availability times for this date
     avail_result = supabase.table('supabase_availability')\
         .select('start_time_local, end_time_local')\
         .eq('inspector_id', inspector_id)\
@@ -423,7 +488,6 @@ def fetch_inspector_data(inspector_id: str, date: str) -> Optional[Dict]:
         if avail.get('end_time_local') and str(avail['end_time_local']).lower() != 'none':
             end_time = avail['end_time_local']
     
-    # Check for existing shifts (from capacity view)
     capacity_result = supabase.table('inspector_capacity_view')\
         .select('shift_details, booked_minutes, remaining_minutes')\
         .eq('inspector_id', inspector_id)\
@@ -447,18 +511,15 @@ def fetch_inspector_data(inspector_id: str, date: str) -> Optional[Dict]:
                     except (ValueError, TypeError):
                         pass
     
-    # Calculate actual available start time
     try:
         st = datetime.strptime(start_time, '%H:%M:%S').time()
         start_min = st.hour * 60 + st.minute
     except (ValueError, TypeError):
         start_min = 9 * 60
     
-    # Adjust for existing shifts (+15 min buffer)
     if latest_shift_end_min > start_min:
         start_min = latest_shift_end_min + 15
     
-    # Ensure minimum 09:00 start
     start_min = max(9 * 60, start_min)
     
     return {
@@ -476,13 +537,6 @@ def fetch_inspector_data(inspector_id: str, date: str) -> Optional[Dict]:
 def fetch_monday_items(item_ids: List[int], include_scheduled: bool = False) -> List[Dict]:
     """
     Fetch inspection details from monday_items_selected table.
-    
-    Args:
-        item_ids: List of monday_items_selected.id values (bigint)
-        include_scheduled: If True, also fetch scheduled_start_time and scheduled_end_time
-    
-    Returns:
-        List of inspection dicts with coordinates and durations
     """
     if not item_ids:
         return []
@@ -502,18 +556,16 @@ def fetch_monday_items(item_ids: List[int], include_scheduled: bool = False) -> 
     missing_coords = []
     
     for item in (result.data or []):
-        # Check for coordinates
         if not item.get('lat') or not item.get('lng'):
             missing_coords.append(item.get('adresse', f"ID: {item['id']}"))
             continue
         
-        # Get duration based on type and rooms
         inspection_type = item.get('synstype', 'Indflytningssyn')
         rooms = item.get('antal_vaerelser', 3)
         duration = get_inspection_duration(inspection_type, rooms)
         
         ins_data = {
-            'id': item['id'],  # Keep as integer for monday_items_selected
+            'id': item['id'],
             'address': item.get('adresse', 'Ukendt adresse'),
             'inspection_type': inspection_type,
             'rooms': rooms,
@@ -523,7 +575,6 @@ def fetch_monday_items(item_ids: List[int], include_scheduled: bool = False) -> 
             'preferred_date': item.get('dato_tid')
         }
         
-        # Include scheduled times if requested
         if include_scheduled:
             ins_data['scheduled_start_time'] = item.get('scheduled_start_time')
             ins_data['scheduled_end_time'] = item.get('scheduled_end_time')
@@ -532,7 +583,7 @@ def fetch_monday_items(item_ids: List[int], include_scheduled: bool = False) -> 
     
     if missing_coords:
         print(f"  ⚠️ Skipping {len(missing_coords)} items without coordinates:")
-        for addr in missing_coords[:5]:  # Show first 5
+        for addr in missing_coords[:5]:
             print(f"      - {addr}")
         if len(missing_coords) > 5:
             print(f"      ... and {len(missing_coords) - 5} more")
@@ -542,7 +593,182 @@ def fetch_monday_items(item_ids: List[int], include_scheduled: bool = False) -> 
 
 
 # ============================================================================
-# MAIN OPTIMIZATION FUNCTION
+# OPTION B: Parse and validate fixed_stops
+# ============================================================================
+
+def parse_fixed_stops(fixed_stops_raw: List[Dict]) -> List[Dict]:
+    """
+    Parse and validate fixed_stops from the request.
+    Returns list of valid fixed stops with coordinates and times.
+    
+    OPTION B: Fixed stops are booked shifts passed by coordinates instead of monday_item_id.
+    """
+    if not fixed_stops_raw:
+        return []
+    
+    valid_stops = []
+    for i, stop in enumerate(fixed_stops_raw):
+        lat = stop.get('lat')
+        lng = stop.get('lng')
+        start_time = stop.get('start_time', '')
+        end_time = stop.get('end_time', '')
+        
+        # Validate required fields
+        if lat is None or lng is None:
+            print(f"  ⚠️ Fixed stop {i} missing coordinates, skipping")
+            continue
+        
+        if not start_time or not end_time:
+            print(f"  ⚠️ Fixed stop {i} missing times, skipping")
+            continue
+        
+        valid_stops.append({
+            'lat': float(lat),
+            'lng': float(lng),
+            'start_time': start_time[:5] if len(start_time) > 5 else start_time,  # HH:MM
+            'end_time': end_time[:5] if len(end_time) > 5 else end_time,
+            'address': stop.get('address', 'Booked shift'),
+            'type': stop.get('type', 'B'),  # B for Booked
+            'is_fixed': True
+        })
+    
+    # Sort by start time
+    valid_stops.sort(key=lambda x: time_str_to_minutes(x['start_time']))
+    
+    return valid_stops
+
+
+# ============================================================================
+# OPTION B: Schedule new inspections after fixed stops
+# ============================================================================
+
+def schedule_after_fixed_stops(
+    inspector: Dict,
+    fixed_stops: List[Dict],
+    new_inspections: List[Dict],
+    home_coords: Tuple[float, float],
+    day_midnight: datetime
+) -> Tuple[List[Dict], float]:
+    """
+    Schedule new inspections starting after the last fixed stop.
+    
+    OPTION B: This handles the case where we have booked shifts (fixed_stops)
+    but need to schedule new inspections after them.
+    
+    Returns: (route_stops, total_km)
+    """
+    route_stops = []
+    total_km = 0.0
+    
+    # First, add fixed stops to the route (they keep their times)
+    prev_coords = home_coords
+    for seq, stop in enumerate(fixed_stops, start=1):
+        stop_coords = (stop['lat'], stop['lng'])
+        
+        # Calculate distance from previous
+        leg_km = get_cached_distance_km(prev_coords[0], prev_coords[1], stop_coords[0], stop_coords[1])
+        total_km += leg_km
+        
+        # Calculate travel time (for display only - times are fixed)
+        travel_min = 0 if seq == 1 else int(round(get_cached_travel_time(
+            prev_coords[0], prev_coords[1], stop_coords[0], stop_coords[1]
+        )))
+        
+        route_stops.append({
+            'sequence': seq,
+            'monday_item_id': None,  # Fixed stops don't have monday_item_id
+            'address': stop['address'],
+            'inspection_type': stop.get('type', 'B'),
+            'rooms': None,
+            'start_time': stop['start_time'],
+            'end_time': stop['end_time'],
+            'duration_minutes': time_str_to_minutes(stop['end_time']) - time_str_to_minutes(stop['start_time']),
+            'travel_from_previous_mins': travel_min,
+            'distance_from_previous_km': round(leg_km, 1),
+            'is_existing': True,
+            'is_fixed': True
+        })
+        
+        prev_coords = stop_coords
+    
+    # If no new inspections, just return fixed stops
+    if not new_inspections:
+        # Add return home distance
+        if fixed_stops:
+            last_coords = (fixed_stops[-1]['lat'], fixed_stops[-1]['lng'])
+            total_km += get_cached_distance_km(last_coords[0], last_coords[1], home_coords[0], home_coords[1])
+        return route_stops, total_km
+    
+    # Determine starting point and time for new inspections
+    if fixed_stops:
+        last_fixed = fixed_stops[-1]
+        start_coords = (last_fixed['lat'], last_fixed['lng'])
+        current_min = time_str_to_minutes(last_fixed['end_time'])
+        print(f"  📍 Starting new inspections from last fixed stop: {last_fixed['address'][:30]} at {last_fixed['end_time']}")
+    else:
+        start_coords = home_coords
+        current_min = inspector['available_start_min']
+    
+    # Build coordinates for TSP
+    stop_coords = [(ins['lat'], ins['lng']) for ins in new_inspections]
+    stop_ids = [ins['id'] for ins in new_inspections]
+    inspection_by_id = {ins['id']: ins for ins in new_inspections}
+    
+    # Solve TSP starting from last fixed stop (or home)
+    optimal_order, new_route_km = solve_tsp_from_point(start_coords, home_coords, stop_coords, stop_ids)
+    total_km += new_route_km
+    
+    # Build schedule for new inspections
+    prev_coords = start_coords
+    base_seq = len(route_stops)
+    
+    for seq_offset, inspection_id in enumerate(optimal_order, start=1):
+        ins = inspection_by_id[inspection_id]
+        ins_coords = (ins['lat'], ins['lng'])
+        
+        # Calculate travel time from previous location
+        travel_min, leg_km = get_cached_travel_data(
+            prev_coords[0], prev_coords[1],
+            ins_coords[0], ins_coords[1]
+        )
+        travel_min = int(round(travel_min))
+        
+        # Add travel time to current time
+        current_min += travel_min
+        
+        # Round start time to nearest 5 min
+        start_dt = day_midnight + timedelta(minutes=current_min)
+        start_dt = round_to_nearest_5_min(start_dt)
+        current_min = (start_dt - day_midnight).seconds // 60
+        
+        # Calculate end time
+        duration = ins['duration_minutes']
+        end_min = current_min + duration
+        end_dt = day_midnight + timedelta(minutes=end_min)
+        
+        route_stops.append({
+            'sequence': base_seq + seq_offset,
+            'monday_item_id': ins['id'],
+            'address': ins['address'],
+            'inspection_type': ins['inspection_type'],
+            'rooms': ins['rooms'],
+            'start_time': start_dt.strftime('%H:%M'),
+            'end_time': end_dt.strftime('%H:%M'),
+            'duration_minutes': duration,
+            'travel_from_previous_mins': travel_min,
+            'distance_from_previous_km': round(leg_km, 1),
+            'is_existing': False,
+            'is_fixed': False
+        })
+        
+        current_min = end_min
+        prev_coords = ins_coords
+    
+    return route_stops, total_km
+
+
+# ============================================================================
+# MAIN OPTIMIZATION FUNCTION (UPDATED FOR OPTION B)
 # ============================================================================
 
 def optimize_inspector_routes(
@@ -553,11 +779,8 @@ def optimize_inspector_routes(
     """
     Optimize routes for pre-assigned inspections.
     
-    This solves ONLY the routing/sequencing problem (TSP) - the assignment
-    of inspections to inspectors has already been done by the user.
-    
-    NEW: Supports existing_ids - inspections that are already scheduled.
-    These keep their fixed times and new inspections are scheduled around them.
+    OPTION B UPDATE: Now supports fixed_stops - booked shifts passed by coordinates.
+    If fixed_stops are provided, new inspections are scheduled after the last fixed stop.
     
     Args:
         date: Target date (YYYY-MM-DD format)
@@ -565,8 +788,17 @@ def optimize_inspector_routes(
             [
                 {
                     "inspector_id": "uuid",
-                    "inspection_ids": [123, 456, ...],  # All inspection IDs
-                    "existing_ids": [123]  # Optional: IDs that are already scheduled (keep times)
+                    "inspection_ids": [123, 456, ...],
+                    "existing_ids": [123],  # Optional: IDs that are already scheduled
+                    "fixed_stops": [        # OPTION B: Booked shifts by coordinates
+                        {
+                            "lat": 55.646404,
+                            "lng": 12.291489,
+                            "start_time": "09:00",
+                            "end_time": "10:20",
+                            "address": "Some address"
+                        }
+                    ]
                 },
                 ...
             ]
@@ -598,13 +830,17 @@ def optimize_inspector_routes(
         inspector_id = assignment.get('inspector_id')
         inspection_ids = assignment.get('inspection_ids', [])
         existing_ids = set(int(id) for id in assignment.get('existing_ids', []))
+        fixed_stops_raw = assignment.get('fixed_stops', [])  # OPTION B
         
         if not inspector_id:
             errors.append("Missing inspector_id in assignment")
             continue
         
-        if not inspection_ids:
-            print(f"  ⚠️ No inspections for inspector {inspector_id}")
+        # OPTION B: Parse fixed stops
+        fixed_stops = parse_fixed_stops(fixed_stops_raw)
+        
+        if not inspection_ids and not fixed_stops:
+            print(f"  ⚠️ No inspections or fixed stops for inspector {inspector_id}")
             continue
         
         # Convert inspection_ids to integers
@@ -623,40 +859,46 @@ def optimize_inspector_routes(
         print(f"\n📍 {inspector['full_name']}")
         print(f"   Home: {inspector['home_address']}")
         print(f"   Available from: {inspector['available_start_min'] // 60:02d}:{inspector['available_start_min'] % 60:02d}")
-        print(f"   Existing (locked): {len(existing_ids)} | New: {len(inspection_ids) - len(existing_ids)}")
+        print(f"   Fixed stops (booked): {len(fixed_stops)} | Existing (locked): {len(existing_ids)} | New: {len(inspection_ids) - len(existing_ids)}")
         
-        # Fetch inspection data (include scheduled times for existing)
-        inspections = fetch_monday_items(inspection_ids, include_scheduled=True)
-        if not inspections:
-            errors.append(f"No valid inspections found for {inspector['full_name']}")
-            continue
-        
-        # Separate existing vs new inspections
-        existing_inspections = [ins for ins in inspections if ins['id'] in existing_ids]
-        new_inspections = [ins for ins in inspections if ins['id'] not in existing_ids]
-        
-        print(f"   Loaded: {len(existing_inspections)} existing, {len(new_inspections)} new")
-        
-        # Build coordinates for TSP (only for new inspections)
         home_coords = (inspector['home_lat'], inspector['home_lng'])
         
-        if existing_inspections and new_inspections:
-            # MIXED CASE: Existing + New inspections
-            # Strategy: Keep existing times fixed, schedule new ones in gaps
-            route_stops, route_km = schedule_mixed_route(
-                inspector, existing_inspections, new_inspections, 
-                home_coords, day_midnight, tz
-            )
-        elif existing_inspections:
-            # ONLY EXISTING: Just return their scheduled times
-            route_stops, route_km = build_existing_only_route(
-                inspector, existing_inspections, home_coords, day_midnight
+        # OPTION B: If we have fixed_stops, use the new scheduling logic
+        if fixed_stops:
+            # Fetch only NEW inspection data (not existing_ids)
+            new_inspection_ids = [id for id in inspection_ids if id not in existing_ids]
+            new_inspections = fetch_monday_items(new_inspection_ids) if new_inspection_ids else []
+            
+            print(f"   Using fixed_stops mode: {len(fixed_stops)} fixed + {len(new_inspections)} new")
+            
+            route_stops, route_km = schedule_after_fixed_stops(
+                inspector, fixed_stops, new_inspections, home_coords, day_midnight
             )
         else:
-            # ONLY NEW: Standard TSP optimization
-            route_stops, route_km = schedule_new_only_route(
-                inspector, new_inspections, home_coords, day_midnight
-            )
+            # Original logic without fixed_stops
+            inspections = fetch_monday_items(inspection_ids, include_scheduled=True)
+            if not inspections:
+                errors.append(f"No valid inspections found for {inspector['full_name']}")
+                continue
+            
+            existing_inspections = [ins for ins in inspections if ins['id'] in existing_ids]
+            new_inspections = [ins for ins in inspections if ins['id'] not in existing_ids]
+            
+            print(f"   Loaded: {len(existing_inspections)} existing, {len(new_inspections)} new")
+            
+            if existing_inspections and new_inspections:
+                route_stops, route_km = schedule_mixed_route(
+                    inspector, existing_inspections, new_inspections, 
+                    home_coords, day_midnight, tz
+                )
+            elif existing_inspections:
+                route_stops, route_km = build_existing_only_route(
+                    inspector, existing_inspections, home_coords, day_midnight
+                )
+            else:
+                route_stops, route_km = schedule_new_only_route(
+                    inspector, new_inspections, home_coords, day_midnight
+                )
         
         print(f"   Optimal route: {route_km:.1f} km (including return home)")
         total_km += route_km
@@ -666,20 +908,40 @@ def optimize_inspector_routes(
             total_travel_minutes += stop.get('travel_from_previous_mins', 0)
             total_scheduled += 1
             
-            is_existing = stop['monday_item_id'] in existing_ids
-            lock_status = "🔒 LOCKED" if is_existing else "🆕 NEW"
-            print(f"      {stop['sequence']}. {stop['address'][:35]} | {stop['start_time']}-{stop['end_time']} | {lock_status}")
+            is_fixed = stop.get('is_fixed', False)
+            is_existing = stop.get('is_existing', False)
+            if is_fixed:
+                lock_status = "🔒 FIXED"
+            elif is_existing:
+                lock_status = "🔒 LOCKED"
+            else:
+                lock_status = "🆕 NEW"
+            
+            addr_display = (stop.get('address') or 'Unknown')[:35]
+            print(f"      {stop['sequence']}. {addr_display} | {stop['start_time']}-{stop['end_time']} | {lock_status}")
         
         # Calculate return home
         if route_stops:
             last_stop = route_stops[-1]
-            last_ins = next((ins for ins in inspections if ins['id'] == last_stop['monday_item_id']), None)
-            if last_ins:
-                return_home_km = get_cached_distance_km(
-                    last_ins['lat'], last_ins['lng'],
-                    home_coords[0], home_coords[1]
-                )
-                print(f"      → Return home: {return_home_km:.1f} km")
+            # Find coordinates of last stop
+            if fixed_stops and last_stop.get('is_fixed'):
+                # Last stop is a fixed stop
+                last_fixed = [s for s in fixed_stops if s['start_time'] == last_stop['start_time']]
+                if last_fixed:
+                    return_home_km = get_cached_distance_km(
+                        last_fixed[0]['lat'], last_fixed[0]['lng'],
+                        home_coords[0], home_coords[1]
+                    )
+                    print(f"      → Return home: {return_home_km:.1f} km")
+            elif last_stop.get('monday_item_id'):
+                # Last stop is a monday item - fetch coords
+                last_items = fetch_monday_items([last_stop['monday_item_id']])
+                if last_items:
+                    return_home_km = get_cached_distance_km(
+                        last_items[0]['lat'], last_items[0]['lng'],
+                        home_coords[0], home_coords[1]
+                    )
+                    print(f"      → Return home: {return_home_km:.1f} km")
         
         # Build route summary
         route_summary = {
@@ -687,8 +949,9 @@ def optimize_inspector_routes(
             'inspector_name': inspector['full_name'],
             'home_address': inspector['home_address'],
             'total_inspections': len(route_stops),
-            'existing_count': len(existing_inspections),
-            'new_count': len(new_inspections),
+            'fixed_count': len(fixed_stops),
+            'existing_count': len([s for s in route_stops if s.get('is_existing') and not s.get('is_fixed')]),
+            'new_count': len([s for s in route_stops if not s.get('is_existing')]),
             'total_km': round(route_km, 1),
             'total_travel_minutes': sum(s.get('travel_from_previous_mins', 0) for s in route_stops),
             'start_time': route_stops[0]['start_time'] if route_stops else None,
@@ -725,17 +988,17 @@ def optimize_inspector_routes(
     }
 
 
+# ============================================================================
+# EXISTING HELPER FUNCTIONS (unchanged)
+# ============================================================================
+
 def build_existing_only_route(
     inspector: Dict,
     existing_inspections: List[Dict],
     home_coords: Tuple[float, float],
     day_midnight: datetime
 ) -> Tuple[List[Dict], float]:
-    """
-    Build route for inspector with ONLY existing (already scheduled) inspections.
-    Just returns their existing times in order.
-    """
-    # Sort by scheduled start time
+    """Build route for inspector with ONLY existing (already scheduled) inspections."""
     existing_inspections.sort(key=lambda x: time_str_to_minutes(x.get('scheduled_start_time', '09:00')))
     
     route_stops = []
@@ -745,15 +1008,12 @@ def build_existing_only_route(
     for seq, ins in enumerate(existing_inspections, start=1):
         ins_coords = (ins['lat'], ins['lng'])
         
-        # Get times from scheduled values
         start_time = ins.get('scheduled_start_time', '09:00')
         end_time = ins.get('scheduled_end_time', '10:00')
         
-        # Calculate distance from previous
         leg_km = get_cached_distance_km(prev_coords[0], prev_coords[1], ins_coords[0], ins_coords[1])
         total_km += leg_km
         
-        # Calculate travel time
         travel_min = 0 if seq == 1 else int(round(get_cached_travel_time(
             prev_coords[0], prev_coords[1], ins_coords[0], ins_coords[1]
         )))
@@ -764,7 +1024,7 @@ def build_existing_only_route(
             'address': ins['address'],
             'inspection_type': ins['inspection_type'],
             'rooms': ins['rooms'],
-            'start_time': start_time[:5] if len(start_time) > 5 else start_time,  # HH:MM
+            'start_time': start_time[:5] if len(start_time) > 5 else start_time,
             'end_time': end_time[:5] if len(end_time) > 5 else end_time,
             'duration_minutes': ins['duration_minutes'],
             'travel_from_previous_mins': travel_min,
@@ -774,7 +1034,6 @@ def build_existing_only_route(
         
         prev_coords = ins_coords
     
-    # Add return home distance
     if existing_inspections:
         last_coords = (existing_inspections[-1]['lat'], existing_inspections[-1]['lng'])
         total_km += get_cached_distance_km(last_coords[0], last_coords[1], home_coords[0], home_coords[1])
@@ -788,21 +1047,14 @@ def schedule_new_only_route(
     home_coords: Tuple[float, float],
     day_midnight: datetime
 ) -> Tuple[List[Dict], float]:
-    """
-    Schedule route for inspector with ONLY new inspections.
-    Standard TSP optimization starting at inspector's available time.
-    """
-    # Build coordinates for TSP
+    """Schedule route for inspector with ONLY new inspections."""
     stop_coords = [(ins['lat'], ins['lng']) for ins in new_inspections]
     stop_ids = [ins['id'] for ins in new_inspections]
     
-    # Create lookup by ID
     inspection_by_id = {ins['id']: ins for ins in new_inspections}
     
-    # Solve TSP
     optimal_order, route_km = solve_tsp(home_coords, stop_coords, stop_ids)
     
-    # Build schedule with times
     current_min = inspector['available_start_min']
     route_stops = []
     prev_coords = home_coords
@@ -811,7 +1063,6 @@ def schedule_new_only_route(
         ins = inspection_by_id[inspection_id]
         ins_coords = (ins['lat'], ins['lng'])
         
-        # Calculate travel time and distance from previous location
         if seq == 1:
             travel_min = 0
             leg_km = get_cached_distance_km(prev_coords[0], prev_coords[1], ins_coords[0], ins_coords[1])
@@ -823,12 +1074,10 @@ def schedule_new_only_route(
             travel_min = int(round(travel_min))
             current_min += travel_min
         
-        # Round start time to nearest 5 min
         start_dt = day_midnight + timedelta(minutes=current_min)
         start_dt = round_to_nearest_5_min(start_dt)
         current_min = (start_dt - day_midnight).seconds // 60
         
-        # Calculate end time
         duration = ins['duration_minutes']
         end_min = current_min + duration
         end_dt = day_midnight + timedelta(minutes=end_min)
@@ -861,18 +1110,9 @@ def schedule_mixed_route(
     day_midnight: datetime,
     tz
 ) -> Tuple[List[Dict], float]:
-    """
-    Schedule route with BOTH existing (locked) and new inspections.
-    
-    Strategy:
-    1. Keep existing inspections at their fixed times
-    2. Find gaps between existing inspections
-    3. Assign new inspections to optimal gaps based on location
-    """
-    # Sort existing by start time
+    """Schedule route with BOTH existing (locked) and new inspections."""
     existing_inspections.sort(key=lambda x: time_str_to_minutes(x.get('scheduled_start_time', '09:00')))
     
-    # Build timeline of existing slots
     existing_slots = []
     for ins in existing_inspections:
         start_min = time_str_to_minutes(ins.get('scheduled_start_time', '09:00'))
@@ -884,16 +1124,10 @@ def schedule_mixed_route(
             'coords': (ins['lat'], ins['lng'])
         })
     
-    # Find gaps for new inspections
-    # Gap 1: Before first existing inspection
-    # Gap 2-N: Between existing inspections
-    # Gap N+1: After last existing inspection
-    
     gaps = []
     day_start = inspector['available_start_min']
-    day_end = 17 * 60  # 17:00
+    day_end = 17 * 60
     
-    # Gap before first
     if existing_slots:
         first_start = existing_slots[0]['start_min']
         if first_start > day_start:
@@ -904,11 +1138,10 @@ def schedule_mixed_route(
                 'next_coords': existing_slots[0]['coords']
             })
     
-    # Gaps between existing
     for i in range(len(existing_slots) - 1):
         gap_start = existing_slots[i]['end_min']
         gap_end = existing_slots[i + 1]['start_min']
-        if gap_end > gap_start + 15:  # At least 15 min gap
+        if gap_end > gap_start + 15:
             gaps.append({
                 'start_min': gap_start,
                 'end_min': gap_end,
@@ -916,7 +1149,6 @@ def schedule_mixed_route(
                 'next_coords': existing_slots[i + 1]['coords']
             })
     
-    # Gap after last
     if existing_slots:
         last_end = existing_slots[-1]['end_min']
         if day_end > last_end:
@@ -927,7 +1159,6 @@ def schedule_mixed_route(
                 'next_coords': home_coords
             })
     else:
-        # No existing, entire day is a gap
         gaps.append({
             'start_min': day_start,
             'end_min': day_end,
@@ -935,17 +1166,14 @@ def schedule_mixed_route(
             'next_coords': home_coords
         })
     
-    # Assign new inspections to gaps (greedy by travel efficiency)
     assigned_new = []
     remaining_new = list(new_inspections)
     
     for gap in gaps:
-        gap_duration = gap['end_min'] - gap['start_min']
         current_min = gap['start_min']
         prev_coords = gap['prev_coords']
         
         while remaining_new and current_min < gap['end_min']:
-            # Find best inspection for this gap (closest to prev_coords)
             best_ins = None
             best_score = float('inf')
             
@@ -953,11 +1181,9 @@ def schedule_mixed_route(
                 ins_coords = (ins['lat'], ins['lng'])
                 travel_to = get_cached_travel_time(prev_coords[0], prev_coords[1], ins_coords[0], ins_coords[1])
                 travel_out = get_cached_travel_time(ins_coords[0], ins_coords[1], gap['next_coords'][0], gap['next_coords'][1])
-                total_time = travel_to + ins['duration_minutes']
                 
-                # Check if it fits in remaining gap
                 if current_min + travel_to + ins['duration_minutes'] <= gap['end_min']:
-                    score = travel_to + travel_out  # Prefer lower total detour
+                    score = travel_to + travel_out
                     if score < best_score:
                         best_score = score
                         best_ins = ins
@@ -966,10 +1192,8 @@ def schedule_mixed_route(
                 ins_coords = (best_ins['lat'], best_ins['lng'])
                 travel_min = int(round(get_cached_travel_time(prev_coords[0], prev_coords[1], ins_coords[0], ins_coords[1])))
                 
-                # Add travel time
                 current_min += travel_min
                 
-                # Round to nearest 5 min
                 start_dt = day_midnight + timedelta(minutes=current_min)
                 start_dt = round_to_nearest_5_min(start_dt)
                 current_min = (start_dt - day_midnight).seconds // 60
@@ -991,9 +1215,8 @@ def schedule_mixed_route(
                 prev_coords = ins_coords
                 current_min = end_min
             else:
-                break  # No more inspections fit in this gap
+                break
     
-    # Build combined route (existing + assigned new, sorted by start time)
     all_stops = []
     
     for slot in existing_slots:
@@ -1016,10 +1239,8 @@ def schedule_mixed_route(
             'is_existing': False
         })
     
-    # Sort by start time
     all_stops.sort(key=lambda x: x['start_min'])
     
-    # Build final route_stops with distances
     route_stops = []
     total_km = 0.0
     prev_coords = home_coords
@@ -1028,15 +1249,12 @@ def schedule_mixed_route(
         ins = stop['inspection']
         ins_coords = (ins['lat'], ins['lng'])
         
-        # Calculate distance
         leg_km = get_cached_distance_km(prev_coords[0], prev_coords[1], ins_coords[0], ins_coords[1])
         total_km += leg_km
         
-        # Calculate travel time
         if seq == 1:
             travel_min = 0
         elif stop['is_existing']:
-            # For existing, recalculate travel time
             travel_min = int(round(get_cached_travel_time(
                 prev_coords[0], prev_coords[1], ins_coords[0], ins_coords[1]
             )))
@@ -1059,13 +1277,11 @@ def schedule_mixed_route(
         
         prev_coords = ins_coords
     
-    # Add return home distance
     if all_stops:
         last_ins = all_stops[-1]['inspection']
         last_coords = (last_ins['lat'], last_ins['lng'])
         total_km += get_cached_distance_km(last_coords[0], last_coords[1], home_coords[0], home_coords[1])
     
-    # Note any unassigned new inspections
     if remaining_new:
         print(f"  ⚠️ Could not fit {len(remaining_new)} new inspections in available gaps")
         for ins in remaining_new:
@@ -1075,12 +1291,9 @@ def schedule_mixed_route(
 
 
 # ============================================================================
-# CONVENIENCE FUNCTION - Get optimal times without saving
+# CONVENIENCE FUNCTION
 # ============================================================================
 
 def preview_routes(date: str, assignments: List[Dict]) -> Dict:
-    """
-    Preview optimized routes without saving to database.
-    Use this for UI preview before final confirmation.
-    """
+    """Preview optimized routes without saving to database."""
     return optimize_inspector_routes(date, assignments, save_to_db=False)
