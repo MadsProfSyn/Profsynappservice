@@ -9,6 +9,7 @@ UPDATED: Uses cached Mapbox distance_km for accurate route totals
 UPDATED: Supports existing_ids - inspections that are already scheduled and should keep their times
 UPDATED: Calls Mapbox Directions API on cache miss (no more Haversine fallback)
 UPDATED: Supports fixed_stops - booked shifts passed by coordinates (Option B)
+UPDATED: Supports DYMO (+5 min) and Cylinderskift (+10 min) duration adjustments
 
 Expected performance: <2 seconds for typical workloads (2-5 inspectors, 3-7 inspections each)
 """
@@ -223,10 +224,14 @@ def time_str_to_minutes(time_str: str) -> int:
 # INSPECTION TYPE TO DURATION MAPPING
 # ============================================================================
 
-def get_inspection_duration(inspection_type: str, rooms: int) -> int:
+def get_inspection_duration(inspection_type: str, rooms: int,
+                            has_dymo: bool = False, has_cylinderskift: bool = False) -> int:
     """
-    Get inspection duration in minutes based on type and room count.
-    Falls back to default if not found.
+    Get inspection duration in minutes based on type, room count, and extras.
+    
+    Extras (only apply to IF and PS types):
+    - DYMO: +5 minutes
+    - Cylinderskift: +10 minutes
     """
     type_mapping = {
         'Proforma': 'PA',
@@ -240,6 +245,8 @@ def get_inspection_duration(inspection_type: str, rooms: int) -> int:
         print(f"  ⚠️ Unknown inspection type: {inspection_type}, using default 45 min")
         return 45
     
+    # Get base duration from database
+    duration = None
     try:
         result = supabase.table('inspection_durations')\
             .select('minutes')\
@@ -248,12 +255,26 @@ def get_inspection_duration(inspection_type: str, rooms: int) -> int:
             .execute()
         
         if result.data and len(result.data) > 0:
-            return result.data[0]['minutes']
+            duration = result.data[0]['minutes']
     except Exception as e:
         print(f"  ⚠️ Error fetching duration: {e}")
     
-    defaults = {'PA': 30, 'PS': 45, 'IF': 45, 'FF': 60}
-    return defaults.get(abbrev, 45)
+    # Fallback defaults if not found in database
+    if duration is None:
+        defaults = {'PA': 30, 'PS': 45, 'IF': 45, 'FF': 60}
+        duration = defaults.get(abbrev, 45)
+        print(f"  ⚠️ Using fallback duration: {duration} min for {abbrev}")
+    
+    # Add extras for IF and PS types only (matching Zapier logic)
+    if abbrev in ['IF', 'PS']:
+        if has_dymo:
+            duration += 5
+            print(f"  📌 +5 min for DYMO")
+        if has_cylinderskift:
+            duration += 10
+            print(f"  🔧 +10 min for Cylinderskift")
+    
+    return duration
 
 
 # ============================================================================
@@ -537,13 +558,15 @@ def fetch_inspector_data(inspector_id: str, date: str) -> Optional[Dict]:
 def fetch_monday_items(item_ids: List[int], include_scheduled: bool = False) -> List[Dict]:
     """
     Fetch inspection details from monday_items_selected table.
+    Includes has_dymo and has_cylinderskift flags for duration adjustments.
     """
     if not item_ids:
         return []
     
     print(f"  📋 Fetching {len(item_ids)} items from monday_items_selected...")
     
-    select_fields = 'id, adresse, synstype, antal_vaerelser, lat, lng, dato_tid'
+    # UPDATED: Include has_dymo and has_cylinderskift
+    select_fields = 'id, adresse, synstype, antal_vaerelser, lat, lng, dato_tid, has_dymo, has_cylinderskift'
     if include_scheduled:
         select_fields += ', scheduled_start_time, scheduled_end_time'
     
@@ -561,8 +584,12 @@ def fetch_monday_items(item_ids: List[int], include_scheduled: bool = False) -> 
             continue
         
         inspection_type = item.get('synstype', 'Indflytningssyn')
-        rooms = item.get('antal_vaerelser', 3)
-        duration = get_inspection_duration(inspection_type, rooms)
+        rooms = item.get('antal_vaerelser') or 3  # Default to 3 if NULL
+        has_dymo = item.get('has_dymo', False) or False
+        has_cylinderskift = item.get('has_cylinderskift', False) or False
+        
+        # Get duration with extras
+        duration = get_inspection_duration(inspection_type, rooms, has_dymo, has_cylinderskift)
         
         ins_data = {
             'id': item['id'],
@@ -572,7 +599,9 @@ def fetch_monday_items(item_ids: List[int], include_scheduled: bool = False) -> 
             'lat': item['lat'],
             'lng': item['lng'],
             'duration_minutes': duration,
-            'preferred_date': item.get('dato_tid')
+            'preferred_date': item.get('dato_tid'),
+            'has_dymo': has_dymo,
+            'has_cylinderskift': has_cylinderskift
         }
         
         if include_scheduled:
@@ -758,7 +787,9 @@ def schedule_after_fixed_stops(
             'travel_from_previous_mins': travel_min,
             'distance_from_previous_km': round(leg_km, 1),
             'is_existing': False,
-            'is_fixed': False
+            'is_fixed': False,
+            'has_dymo': ins.get('has_dymo', False),
+            'has_cylinderskift': ins.get('has_cylinderskift', False)
         })
         
         current_min = end_min
@@ -910,6 +941,9 @@ def optimize_inspector_routes(
             
             is_fixed = stop.get('is_fixed', False)
             is_existing = stop.get('is_existing', False)
+            has_dymo = stop.get('has_dymo', False)
+            has_cylinderskift = stop.get('has_cylinderskift', False)
+            
             if is_fixed:
                 lock_status = "🔒 FIXED"
             elif is_existing:
@@ -917,8 +951,16 @@ def optimize_inspector_routes(
             else:
                 lock_status = "🆕 NEW"
             
+            # Show extras if present
+            extras = []
+            if has_dymo:
+                extras.append("DYMO")
+            if has_cylinderskift:
+                extras.append("CYL")
+            extras_str = f" [{'+'.join(extras)}]" if extras else ""
+            
             addr_display = (stop.get('address') or 'Unknown')[:35]
-            print(f"      {stop['sequence']}. {addr_display} | {stop['start_time']}-{stop['end_time']} | {lock_status}")
+            print(f"      {stop['sequence']}. {addr_display} | {stop['start_time']}-{stop['end_time']} | {lock_status}{extras_str}")
         
         # Calculate return home
         if route_stops:
@@ -1029,7 +1071,9 @@ def build_existing_only_route(
             'duration_minutes': ins['duration_minutes'],
             'travel_from_previous_mins': travel_min,
             'distance_from_previous_km': round(leg_km, 1),
-            'is_existing': True
+            'is_existing': True,
+            'has_dymo': ins.get('has_dymo', False),
+            'has_cylinderskift': ins.get('has_cylinderskift', False)
         })
         
         prev_coords = ins_coords
@@ -1093,7 +1137,9 @@ def schedule_new_only_route(
             'duration_minutes': duration,
             'travel_from_previous_mins': travel_min,
             'distance_from_previous_km': round(leg_km, 1),
-            'is_existing': False
+            'is_existing': False,
+            'has_dymo': ins.get('has_dymo', False),
+            'has_cylinderskift': ins.get('has_cylinderskift', False)
         })
         
         current_min = end_min
@@ -1272,7 +1318,9 @@ def schedule_mixed_route(
             'duration_minutes': ins['duration_minutes'],
             'travel_from_previous_mins': travel_min,
             'distance_from_previous_km': round(leg_km, 1),
-            'is_existing': stop['is_existing']
+            'is_existing': stop['is_existing'],
+            'has_dymo': ins.get('has_dymo', False),
+            'has_cylinderskift': ins.get('has_cylinderskift', False)
         })
         
         prev_coords = ins_coords
