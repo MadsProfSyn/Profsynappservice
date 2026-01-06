@@ -7,6 +7,7 @@ been assigned to inspectors by the user via drag & drop UI.
 UPDATED: Now works directly with monday_items_selected table (not inspection_queue)
 UPDATED: Uses cached Mapbox distance_km for accurate route totals
 UPDATED: Supports existing_ids - inspections that are already scheduled and should keep their times
+UPDATED: Calls Mapbox Directions API on cache miss (no more Haversine fallback)
 
 Expected performance: <2 seconds for typical workloads (2-5 inspectors, 3-7 inspections each)
 """
@@ -18,6 +19,7 @@ from datetime import datetime, timedelta
 from itertools import permutations
 from typing import List, Dict, Tuple, Optional
 import pytz
+import requests  # <-- ADDED: for Mapbox API calls
 from supabase import create_client, Client
 from dotenv import load_dotenv
 
@@ -25,9 +27,14 @@ load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
+MAPBOX_TOKEN = os.getenv("MAPBOX_TOKEN")  # <-- ADDED: Mapbox API token
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise ValueError("Missing SUPABASE_URL or SUPABASE_SERVICE_KEY environment variables")
+
+# <-- ADDED: Warning if no Mapbox token (will fall back to estimates)
+if not MAPBOX_TOKEN:
+    print("⚠️ WARNING: MAPBOX_TOKEN not set - will use Haversine estimates on cache miss")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -49,6 +56,7 @@ def estimate_travel_minutes(lat1: float, lng1: float, lat2: float, lng2: float) 
     """
     Estimate travel time in minutes based on distance.
     Uses speed tiers: urban (<8km) = 25 km/h, suburban (8-20km) = 35 km/h, highway (20+km) = 65 km/h
+    NOTE: This is only used as last-resort fallback if Mapbox API fails.
     """
     if lat1 == lat2 and lng1 == lng2:
         return 0.0
@@ -77,17 +85,68 @@ def make_cache_key(from_lat: float, from_lng: float, to_lat: float, to_lng: floa
     return f"{from_lng_r:.5f},{from_lat_r:.5f}->{to_lng_r:.5f},{to_lat_r:.5f}"
 
 
+# ============================================================================
+# ADDED: Mapbox Directions API call function
+# ============================================================================
+
+def fetch_mapbox_directions(from_lat: float, from_lng: float, 
+                            to_lat: float, to_lng: float) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Call Mapbox Directions API to get real driving time and distance.
+    Returns (minutes, km) tuple, or (None, None) if API call fails.
+    """
+    if not MAPBOX_TOKEN:
+        return None, None
+    
+    url = f"https://api.mapbox.com/directions/v5/mapbox/driving/{from_lng},{from_lat};{to_lng},{to_lat}"
+    params = {
+        'access_token': MAPBOX_TOKEN,
+        'overview': 'false'  # We don't need the route geometry
+    }
+    
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        
+        if data.get('routes') and len(data['routes']) > 0:
+            route = data['routes'][0]
+            minutes = route['duration'] / 60.0
+            km = route['distance'] / 1000.0
+            print(f"  🗺️ Mapbox API: {minutes:.1f} min, {km:.1f} km")
+            return minutes, km
+        else:
+            print(f"  ⚠️ Mapbox API returned no routes")
+            return None, None
+            
+    except requests.exceptions.Timeout:
+        print(f"  ⚠️ Mapbox API timeout")
+        return None, None
+    except requests.exceptions.RequestException as e:
+        print(f"  ❌ Mapbox API error: {e}")
+        return None, None
+    except Exception as e:
+        print(f"  ❌ Mapbox API unexpected error: {e}")
+        return None, None
+
+
+# ============================================================================
+# MODIFIED: get_cached_travel_data - now calls Mapbox API on cache miss
+# ============================================================================
+
 def get_cached_travel_data(from_lat: float, from_lng: float, 
                            to_lat: float, to_lng: float) -> Tuple[float, float]:
     """
     Get cached travel time (minutes) and distance (km) from Mapbox cache.
-    Returns (minutes, km) tuple. Falls back to estimates if cache miss.
+    On cache miss, calls Mapbox Directions API directly and caches the result.
+    Only falls back to Haversine estimates if Mapbox API also fails.
     """
     if from_lat == to_lat and from_lng == to_lng:
         return 0.0, 0.0
     
     key = make_cache_key(from_lat, from_lng, to_lat, to_lng)
     
+    # Step 1: Check cache
     try:
         result = supabase.table('mapbox_travel_cache')\
             .select('minutes, distance_km')\
@@ -111,7 +170,26 @@ def get_cached_travel_data(from_lat: float, from_lng: float,
     except Exception as e:
         print(f"  ❌ Cache error: {e}")
     
-    # Fallback to estimates
+    # Step 2: Cache miss - call Mapbox API (NEW!)
+    mapbox_minutes, mapbox_km = fetch_mapbox_directions(from_lat, from_lng, to_lat, to_lng)
+    
+    if mapbox_minutes is not None and mapbox_km is not None:
+        # Cache the result for future use
+        try:
+            supabase.table('mapbox_travel_cache').upsert({
+                'key': key,
+                'minutes': mapbox_minutes,
+                'distance_km': mapbox_km,
+                'updated_at': datetime.utcnow().isoformat()
+            }, on_conflict='key').execute()
+            print(f"  💾 Cached new route: {key} = {mapbox_minutes:.1f} min, {mapbox_km:.1f} km")
+        except Exception as e:
+            print(f"  ⚠️ Failed to cache: {e}")
+        
+        return max(5.0, mapbox_minutes), mapbox_km
+    
+    # Step 3: Last resort fallback - Haversine estimates (only if Mapbox API fails)
+    print(f"  ⚠️ Using Haversine fallback for: {key}")
     est_minutes = estimate_travel_minutes(from_lat, from_lng, to_lat, to_lng)
     est_km = haversine_km(from_lat, from_lng, to_lat, to_lng) * 1.3  # Road factor
     return est_minutes, est_km
