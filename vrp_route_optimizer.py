@@ -10,6 +10,7 @@ UPDATED: Supports existing_ids - inspections that are already scheduled and shou
 UPDATED: Calls Mapbox Directions API on cache miss (no more Haversine fallback)
 UPDATED: Supports fixed_stops - booked shifts passed by coordinates (Option B)
 UPDATED: Supports DYMO (+5 min) and Cylinderskift (+10 min) duration adjustments
+UPDATED: Default start time changed to 08:30
 
 Expected performance: <2 seconds for typical workloads (2-5 inspectors, 3-7 inspections each)
 """
@@ -217,7 +218,7 @@ def time_str_to_minutes(time_str: str) -> int:
         minutes = int(parts[1]) if len(parts) > 1 else 0
         return hours * 60 + minutes
     except (ValueError, IndexError):
-        return 9 * 60  # Default 09:00
+        return 8 * 60 + 30  # CHANGED: Default 08:30 (was 9 * 60)
 
 
 # ============================================================================
@@ -499,7 +500,8 @@ def fetch_inspector_data(inspector_id: str, date: str) -> Optional[Dict]:
         .eq('is_available', True)\
         .execute()
     
-    start_time = '09:00:00'
+    # CHANGED: Default start time from 09:00 to 08:30
+    start_time = '08:30:00'
     end_time = '17:00:00'
     
     if avail_result.data and len(avail_result.data) > 0:
@@ -536,12 +538,13 @@ def fetch_inspector_data(inspector_id: str, date: str) -> Optional[Dict]:
         st = datetime.strptime(start_time, '%H:%M:%S').time()
         start_min = st.hour * 60 + st.minute
     except (ValueError, TypeError):
-        start_min = 9 * 60
+        start_min = 8 * 60 + 30  # CHANGED: Default 08:30 (was 9 * 60)
     
     if latest_shift_end_min > start_min:
         start_min = latest_shift_end_min + 15
     
-    start_min = max(9 * 60, start_min)
+    # CHANGED: Minimum start time from 09:00 to 08:30
+    start_min = max(8 * 60 + 30, start_min)  # 8 * 60 + 30 = 510 = 08:30
     
     return {
         'id': inspector['id'],
@@ -1041,7 +1044,7 @@ def build_existing_only_route(
     day_midnight: datetime
 ) -> Tuple[List[Dict], float]:
     """Build route for inspector with ONLY existing (already scheduled) inspections."""
-    existing_inspections.sort(key=lambda x: time_str_to_minutes(x.get('scheduled_start_time', '09:00')))
+    existing_inspections.sort(key=lambda x: time_str_to_minutes(x.get('scheduled_start_time', '08:30')))  # CHANGED default
     
     route_stops = []
     total_km = 0.0
@@ -1050,8 +1053,8 @@ def build_existing_only_route(
     for seq, ins in enumerate(existing_inspections, start=1):
         ins_coords = (ins['lat'], ins['lng'])
         
-        start_time = ins.get('scheduled_start_time', '09:00')
-        end_time = ins.get('scheduled_end_time', '10:00')
+        start_time = ins.get('scheduled_start_time', '08:30')  # CHANGED default
+        end_time = ins.get('scheduled_end_time', '09:45')  # CHANGED default
         
         leg_km = get_cached_distance_km(prev_coords[0], prev_coords[1], ins_coords[0], ins_coords[1])
         total_km += leg_km
@@ -1157,12 +1160,12 @@ def schedule_mixed_route(
     tz
 ) -> Tuple[List[Dict], float]:
     """Schedule route with BOTH existing (locked) and new inspections."""
-    existing_inspections.sort(key=lambda x: time_str_to_minutes(x.get('scheduled_start_time', '09:00')))
+    existing_inspections.sort(key=lambda x: time_str_to_minutes(x.get('scheduled_start_time', '08:30')))  # CHANGED default
     
     existing_slots = []
     for ins in existing_inspections:
-        start_min = time_str_to_minutes(ins.get('scheduled_start_time', '09:00'))
-        end_min = time_str_to_minutes(ins.get('scheduled_end_time', '10:00'))
+        start_min = time_str_to_minutes(ins.get('scheduled_start_time', '08:30'))  # CHANGED default
+        end_min = time_str_to_minutes(ins.get('scheduled_end_time', '09:45'))  # CHANGED default
         existing_slots.append({
             'inspection': ins,
             'start_min': start_min,
@@ -1270,8 +1273,8 @@ def schedule_mixed_route(
         all_stops.append({
             'start_min': slot['start_min'],
             'inspection': ins,
-            'start_time': ins.get('scheduled_start_time', '09:00')[:5],
-            'end_time': ins.get('scheduled_end_time', '10:00')[:5],
+            'start_time': ins.get('scheduled_start_time', '08:30')[:5],  # CHANGED default
+            'end_time': ins.get('scheduled_end_time', '09:45')[:5],  # CHANGED default
             'is_existing': True
         })
     
