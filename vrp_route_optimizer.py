@@ -11,7 +11,7 @@ UPDATED: Calls Mapbox Directions API on cache miss (no more Haversine fallback)
 UPDATED: Supports fixed_stops - booked shifts passed by coordinates (Option B)
 UPDATED: Supports DYMO (+5 min) and Cylinderskift (+10 min) duration adjustments
 UPDATED: Default start time changed to 08:30
-
+UPDATED:TEST
 Expected performance: <2 seconds for typical workloads (2-5 inspectors, 3-7 inspections each)
 """
 
