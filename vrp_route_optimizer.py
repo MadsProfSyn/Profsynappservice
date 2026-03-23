@@ -11,7 +11,7 @@ UPDATED: Calls Mapbox Directions API on cache miss (no more Haversine fallback)
 UPDATED: Supports fixed_stops - booked shifts passed by coordinates (Option B)
 UPDATED: Supports DYMO (+5 min) and Cylinderskift (+10 min) duration adjustments
 UPDATED: Default start time changed to 08:30
-UPDATED:TEST
+UPDATED: Manual duration_minutes override - if set on monday_items_selected, always wins
 Expected performance: <2 seconds for typical workloads (2-5 inspectors, 3-7 inspections each)
 """
 
@@ -218,7 +218,7 @@ def time_str_to_minutes(time_str: str) -> int:
         minutes = int(parts[1]) if len(parts) > 1 else 0
         return hours * 60 + minutes
     except (ValueError, IndexError):
-        return 8 * 60 + 30  # CHANGED: Default 08:30 (was 9 * 60)
+        return 8 * 60 + 30  # Default 08:30
 
 
 # ============================================================================
@@ -233,6 +233,10 @@ def get_inspection_duration(inspection_type: str, rooms: int,
     Extras (only apply to IF and PS types):
     - DYMO: +5 minutes
     - Cylinderskift: +10 minutes
+
+    NOTE: This function is only called when there is NO manual duration_minutes
+    override on the monday_items_selected row. If a manual override exists,
+    it is used directly and this function is never called.
     """
     type_mapping = {
         'Proforma': 'PA',
@@ -500,7 +504,6 @@ def fetch_inspector_data(inspector_id: str, date: str) -> Optional[Dict]:
         .eq('is_available', True)\
         .execute()
     
-    # CHANGED: Default start time from 09:00 to 08:30
     start_time = '08:30:00'
     end_time = '17:00:00'
     
@@ -538,13 +541,12 @@ def fetch_inspector_data(inspector_id: str, date: str) -> Optional[Dict]:
         st = datetime.strptime(start_time, '%H:%M:%S').time()
         start_min = st.hour * 60 + st.minute
     except (ValueError, TypeError):
-        start_min = 8 * 60 + 30  # CHANGED: Default 08:30 (was 9 * 60)
+        start_min = 8 * 60 + 30  # Default 08:30
     
     if latest_shift_end_min > start_min:
         start_min = latest_shift_end_min + 15
     
-    # CHANGED: Minimum start time from 09:00 to 08:30
-    start_min = max(8 * 60 + 30, start_min)  # 8 * 60 + 30 = 510 = 08:30
+    start_min = max(8 * 60 + 30, start_min)  # Minimum 08:30
     
     return {
         'id': inspector['id'],
@@ -561,15 +563,21 @@ def fetch_inspector_data(inspector_id: str, date: str) -> Optional[Dict]:
 def fetch_monday_items(item_ids: List[int], include_scheduled: bool = False) -> List[Dict]:
     """
     Fetch inspection details from monday_items_selected table.
-    Includes has_dymo and has_cylinderskift flags for duration adjustments.
+
+    Duration priority (highest to lowest):
+      1. duration_minutes column on the row (manual override — always wins, no extras added)
+      2. get_inspection_duration() — derived from synstype + antal_vaerelser + DYMO/Cylinderskift flags
     """
     if not item_ids:
         return []
     
     print(f"  📋 Fetching {len(item_ids)} items from monday_items_selected...")
     
-    # UPDATED: Include has_dymo and has_cylinderskift
-    select_fields = 'id, adresse, synstype, antal_vaerelser, lat, lng, dato_tid, has_dymo, has_cylinderskift'
+    # Include duration_minutes so manual overrides can be respected
+    select_fields = (
+        'id, adresse, synstype, antal_vaerelser, lat, lng, dato_tid, '
+        'has_dymo, has_cylinderskift, duration_minutes'
+    )
     if include_scheduled:
         select_fields += ', scheduled_start_time, scheduled_end_time'
     
@@ -590,10 +598,18 @@ def fetch_monday_items(item_ids: List[int], include_scheduled: bool = False) -> 
         rooms = item.get('antal_vaerelser') or 3  # Default to 3 if NULL
         has_dymo = item.get('has_dymo', False) or False
         has_cylinderskift = item.get('has_cylinderskift', False) or False
-        
-        # Get duration with extras
-        duration = get_inspection_duration(inspection_type, rooms, has_dymo, has_cylinderskift)
-        
+
+        # ── Duration resolution ──────────────────────────────────────────────
+        # Manual override always wins — no DYMO/Cylinderskift extras on top.
+        # If not set (NULL / 0), fall back to rule-based calculation.
+        manual_duration = item.get('duration_minutes')
+        if manual_duration and int(manual_duration) > 0:
+            duration = int(manual_duration)
+            print(f"  ✏️ Manual duration override: {duration} min for item {item['id']} ({item.get('adresse', '')[:30]})")
+        else:
+            duration = get_inspection_duration(inspection_type, rooms, has_dymo, has_cylinderskift)
+        # ────────────────────────────────────────────────────────────────────
+
         ins_data = {
             'id': item['id'],
             'address': item.get('adresse', 'Ukendt adresse'),
@@ -604,7 +620,8 @@ def fetch_monday_items(item_ids: List[int], include_scheduled: bool = False) -> 
             'duration_minutes': duration,
             'preferred_date': item.get('dato_tid'),
             'has_dymo': has_dymo,
-            'has_cylinderskift': has_cylinderskift
+            'has_cylinderskift': has_cylinderskift,
+            'duration_is_manual': bool(manual_duration and int(manual_duration) > 0)
         }
         
         if include_scheduled:
@@ -792,7 +809,8 @@ def schedule_after_fixed_stops(
             'is_existing': False,
             'is_fixed': False,
             'has_dymo': ins.get('has_dymo', False),
-            'has_cylinderskift': ins.get('has_cylinderskift', False)
+            'has_cylinderskift': ins.get('has_cylinderskift', False),
+            'duration_is_manual': ins.get('duration_is_manual', False)
         })
         
         current_min = end_min
@@ -946,6 +964,7 @@ def optimize_inspector_routes(
             is_existing = stop.get('is_existing', False)
             has_dymo = stop.get('has_dymo', False)
             has_cylinderskift = stop.get('has_cylinderskift', False)
+            duration_is_manual = stop.get('duration_is_manual', False)
             
             if is_fixed:
                 lock_status = "🔒 FIXED"
@@ -956,6 +975,8 @@ def optimize_inspector_routes(
             
             # Show extras if present
             extras = []
+            if duration_is_manual:
+                extras.append("MANUAL DUR")
             if has_dymo:
                 extras.append("DYMO")
             if has_cylinderskift:
@@ -968,9 +989,7 @@ def optimize_inspector_routes(
         # Calculate return home
         if route_stops:
             last_stop = route_stops[-1]
-            # Find coordinates of last stop
             if fixed_stops and last_stop.get('is_fixed'):
-                # Last stop is a fixed stop
                 last_fixed = [s for s in fixed_stops if s['start_time'] == last_stop['start_time']]
                 if last_fixed:
                     return_home_km = get_cached_distance_km(
@@ -979,7 +998,6 @@ def optimize_inspector_routes(
                     )
                     print(f"      → Return home: {return_home_km:.1f} km")
             elif last_stop.get('monday_item_id'):
-                # Last stop is a monday item - fetch coords
                 last_items = fetch_monday_items([last_stop['monday_item_id']])
                 if last_items:
                     return_home_km = get_cached_distance_km(
@@ -1044,7 +1062,7 @@ def build_existing_only_route(
     day_midnight: datetime
 ) -> Tuple[List[Dict], float]:
     """Build route for inspector with ONLY existing (already scheduled) inspections."""
-    existing_inspections.sort(key=lambda x: time_str_to_minutes(x.get('scheduled_start_time', '08:30')))  # CHANGED default
+    existing_inspections.sort(key=lambda x: time_str_to_minutes(x.get('scheduled_start_time', '08:30')))
     
     route_stops = []
     total_km = 0.0
@@ -1053,8 +1071,8 @@ def build_existing_only_route(
     for seq, ins in enumerate(existing_inspections, start=1):
         ins_coords = (ins['lat'], ins['lng'])
         
-        start_time = ins.get('scheduled_start_time', '08:30')  # CHANGED default
-        end_time = ins.get('scheduled_end_time', '09:45')  # CHANGED default
+        start_time = ins.get('scheduled_start_time', '08:30')
+        end_time = ins.get('scheduled_end_time', '09:45')
         
         leg_km = get_cached_distance_km(prev_coords[0], prev_coords[1], ins_coords[0], ins_coords[1])
         total_km += leg_km
@@ -1076,7 +1094,8 @@ def build_existing_only_route(
             'distance_from_previous_km': round(leg_km, 1),
             'is_existing': True,
             'has_dymo': ins.get('has_dymo', False),
-            'has_cylinderskift': ins.get('has_cylinderskift', False)
+            'has_cylinderskift': ins.get('has_cylinderskift', False),
+            'duration_is_manual': ins.get('duration_is_manual', False)
         })
         
         prev_coords = ins_coords
@@ -1142,7 +1161,8 @@ def schedule_new_only_route(
             'distance_from_previous_km': round(leg_km, 1),
             'is_existing': False,
             'has_dymo': ins.get('has_dymo', False),
-            'has_cylinderskift': ins.get('has_cylinderskift', False)
+            'has_cylinderskift': ins.get('has_cylinderskift', False),
+            'duration_is_manual': ins.get('duration_is_manual', False)
         })
         
         current_min = end_min
@@ -1160,12 +1180,12 @@ def schedule_mixed_route(
     tz
 ) -> Tuple[List[Dict], float]:
     """Schedule route with BOTH existing (locked) and new inspections."""
-    existing_inspections.sort(key=lambda x: time_str_to_minutes(x.get('scheduled_start_time', '08:30')))  # CHANGED default
+    existing_inspections.sort(key=lambda x: time_str_to_minutes(x.get('scheduled_start_time', '08:30')))
     
     existing_slots = []
     for ins in existing_inspections:
-        start_min = time_str_to_minutes(ins.get('scheduled_start_time', '08:30'))  # CHANGED default
-        end_min = time_str_to_minutes(ins.get('scheduled_end_time', '09:45'))  # CHANGED default
+        start_min = time_str_to_minutes(ins.get('scheduled_start_time', '08:30'))
+        end_min = time_str_to_minutes(ins.get('scheduled_end_time', '09:45'))
         existing_slots.append({
             'inspection': ins,
             'start_min': start_min,
@@ -1273,8 +1293,8 @@ def schedule_mixed_route(
         all_stops.append({
             'start_min': slot['start_min'],
             'inspection': ins,
-            'start_time': ins.get('scheduled_start_time', '08:30')[:5],  # CHANGED default
-            'end_time': ins.get('scheduled_end_time', '09:45')[:5],  # CHANGED default
+            'start_time': ins.get('scheduled_start_time', '08:30')[:5],
+            'end_time': ins.get('scheduled_end_time', '09:45')[:5],
             'is_existing': True
         })
     
@@ -1323,7 +1343,8 @@ def schedule_mixed_route(
             'distance_from_previous_km': round(leg_km, 1),
             'is_existing': stop['is_existing'],
             'has_dymo': ins.get('has_dymo', False),
-            'has_cylinderskift': ins.get('has_cylinderskift', False)
+            'has_cylinderskift': ins.get('has_cylinderskift', False),
+            'duration_is_manual': ins.get('duration_is_manual', False)
         })
         
         prev_coords = ins_coords
